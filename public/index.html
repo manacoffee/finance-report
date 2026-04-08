@@ -27,14 +27,11 @@
     .btn-dark { background: #1a1a2e; color: #fff; }
     .btn-outline { background: #fff; color: #1a1a2e; border: 1px solid #ccc; }
     .btn-green { background: #16a34a; color: #fff; }
-    .btn-xero { background: #13B5EA; color: #fff; }
-    .btn-retry { background: #f59e0b; color: #fff; }
     .btn-sm { font-size: 12px; padding: 6px 12px; }
     .btn:disabled { opacity: 0.6; cursor: not-allowed; }
     .import-box { border-radius: 9px; padding: 12px; margin-bottom: 10px; }
     .import-box .title { font-weight: 700; font-size: 13px; margin-bottom: 4px; }
     .import-box .desc { font-size: 12px; color: #666; margin-bottom: 8px; }
-    .xero-box { background: #f0f9ff; border: 1px solid #bae6fd; }
     .ls-box { background: #f8f9ff; border: 1px solid #dde; }
     .pdf-box { background: #fff8f0; border: 1px solid #f0d8b0; }
     .log-box { background: #111; color: #7eff9a; border-radius: 8px; padding: 10px 12px; font-size: 11px; font-family: monospace; max-height: 100px; overflow-y: auto; margin-top: 8px; }
@@ -53,28 +50,20 @@
     .tag-food { background: #16a34a20; color: #16a34a; }
     .tag-uncat { background: #dc262620; color: #dc2626; }
     .ai-box { background: #f9f9fb; border: 1px solid #e0e0e0; border-radius: 12px; padding: 20px; font-size: 13px; color: #333; line-height: 1.75; }
-    .xero-status { font-size: 11px; }
-    .status-connected { color: #16a34a; }
-    .status-error { color: #dc2626; }
-    .status-disconnected { color: #888; }
     .flex { display: flex; }
     .gap-8 { gap: 8px; }
     .align-center { align-items: center; }
     .justify-between { justify-content: space-between; }
-    .flex-wrap { flex-wrap: wrap; }
     .mt-8 { margin-top: 8px; }
     .mt-14 { margin-top: 14px; }
     .hidden { display: none; }
     hr { border: none; border-top: 1px solid #eee; margin: 12px 0; }
     .green-note { font-size: 11px; color: #16a34a; margin-bottom: 8px; }
     .error-note { color: red; font-size: 12px; margin-top: 6px; }
-    .error-banner { background: #fef2f2; border: 1px solid #fca5a5; border-radius: 8px; padding: 10px 12px; font-size: 12px; color: #dc2626; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
-    .date-input { border: 1px solid #ddd; border-radius: 5px; padding: 5px 8px; font-size: 13px; }
   </style>
 </head>
 <body>
 <div class="card" id="app"></div>
-
 <script>
 const GST = 0.1;
 const exGST = v => v / (1 + GST);
@@ -85,10 +74,9 @@ const categFromSupplier = name => { const l = (name || '').toLowerCase(); for (c
 
 let state = {
   step: 'input', tab: 'manual',
-  weekLabel: '', fromDate: '', toDate: '',
-  inputs: { turnoverCoffeeInc: '', turnoverFoodInc: '', cogsCoffeeInc: '', cogsFoodInc: '', labourExGST: '', transactions: '' },
+  weekLabel: '',
+  inputs: { turnoverCoffeeInc: '', turnoverFoodInc: '', cogsCoffeeInc: '', cogsFoodInc: '', labourInc: '', transactions: '' },
   autoFields: {}, invoices: [], log: [],
-  xeroStatus: 'disconnected', xeroLoading: false,
   aiReport: '', aiLoading: false, aiError: '', parsing: false
 };
 
@@ -102,7 +90,7 @@ function calc() {
   const foodEx = exGST(n('turnoverFoodInc'));
   const cogsCoEx = exGST(n('cogsCoffeeInc'));
   const cogsFdEx = exGST(n('cogsFoodInc'));
-  const labourEx = n('labourExGST');
+  const labourEx = exGST(n('labourInc'));
   const txns = n('transactions');
   const total = coffeeEx + foodEx;
   const totalCOGS = cogsCoEx + cogsFdEx;
@@ -199,41 +187,6 @@ function render() {
   const merged = c.merged;
   const isAuto = k => state.autoFields[k] !== undefined;
 
-  // Xero status and buttons
-  let xeroStatusText = '';
-  let xeroActionBtn = '';
-  if (state.xeroStatus === 'connected') {
-    xeroStatusText = '<span class="xero-status status-connected">● Connected</span>';
-    xeroActionBtn = `<button class="btn btn-outline btn-sm" onclick="setState({xeroStatus:'disconnected'})">Disconnect</button>`;
-  } else if (state.xeroStatus === 'error') {
-    xeroStatusText = '<span class="xero-status status-error">● Connection failed</span>';
-    xeroActionBtn = `<button class="btn btn-retry btn-sm" onclick="window.location.href='/api/xero-auth'">Try Again</button>`;
-  } else {
-    xeroStatusText = '<span class="xero-status status-disconnected">○ Not connected</span>';
-    xeroActionBtn = `<button class="btn btn-xero btn-sm" onclick="window.location.href='/api/xero-auth'">Connect Xero</button>`;
-  }
-
-  const xeroErrorBanner = state.xeroStatus === 'error' ? `
-    <div class="error-banner">
-      <span>Xero connection failed. This sometimes happens on the first attempt — please try again.</span>
-      <button class="btn btn-retry btn-sm" onclick="window.location.href='/api/xero-auth'">Try Again</button>
-    </div>` : '';
-
-  const xeroDatePicker = state.xeroStatus === 'connected' ? `
-    <div class="flex gap-8 flex-wrap align-center" style="margin-top:8px">
-      <div>
-        <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">From</label>
-        <input type="date" class="date-input" value="${state.fromDate}" onchange="setState({fromDate:this.value})" />
-      </div>
-      <div>
-        <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">To</label>
-        <input type="date" class="date-input" value="${state.toDate}" onchange="setState({toDate:this.value})" />
-      </div>
-      <button class="btn btn-xero btn-sm" onclick="fetchXeroLabour()" ${state.xeroLoading ? 'disabled' : ''} style="margin-top:14px">
-        ${state.xeroLoading ? 'Fetching…' : 'Fetch Labour'}
-      </button>
-    </div>` : '';
-
   const invoiceHtml = state.invoices.length > 0 ? `
     <div style="margin-top:10px">
       <div style="font-size:11px;font-weight:600;color:#555;margin-bottom:4px">Parsed Invoices:</div>
@@ -256,7 +209,7 @@ function render() {
 
   app.innerHTML = `
     <h2 style="margin:0 0 3px;font-size:19px">Weekly Financial Report</h2>
-    <p class="sub">Revenue and COGS fields accept inc. GST — ex-GST calculated automatically.</p>
+    <p class="sub">Revenue, COGS and Labour fields accept inc. GST — ex-GST calculated automatically.</p>
 
     ${field('weekLabel', 'Week Ending (e.g. 06 Apr 2025)', state.weekLabel, '📅', false)}
 
@@ -267,15 +220,6 @@ function render() {
 
     ${state.tab === 'import' ? `
     <div>
-      ${xeroErrorBanner}
-      <div class="import-box xero-box">
-        <div class="flex justify-between align-center" style="margin-bottom:6px">
-          <div class="title">🔵 Xero — Labour Data</div>
-          <div class="flex align-center gap-8">${xeroStatusText}${xeroActionBtn}</div>
-        </div>
-        <div class="desc">Fetches wages, super and payroll directly from your Xero P&L</div>
-        ${xeroDatePicker}
-      </div>
       <div class="import-box ls-box">
         <div class="title">📊 Lightspeed Excel Report</div>
         <div class="desc">Imports Turnover (Coffee and Food) and Transactions</div>
@@ -297,18 +241,20 @@ function render() {
     <div class="section-label">Revenue (inc. GST)</div>
     ${field('turnoverCoffeeInc', 'Turnover — Coffee (inc. GST)', merged.turnoverCoffeeInc, '$', isAuto('turnoverCoffeeInc'))}
     ${field('turnoverFoodInc', 'Turnover — Food & Bev (inc. GST)', merged.turnoverFoodInc, '$', isAuto('turnoverFoodInc'))}
+
     <div class="section-label">COGS (inc. GST)</div>
     ${field('cogsCoffeeInc', 'COGS — Coffee (inc. GST)', merged.cogsCoffeeInc, '$', isAuto('cogsCoffeeInc'))}
     ${field('cogsFoodInc', 'COGS — Food & Bev (inc. GST)', merged.cogsFoodInc, '$', isAuto('cogsFoodInc'))}
-    <div class="section-label">Labour (ex. GST — from Xero)</div>
-    ${field('labourExGST', 'Labour — Wages, Super and Payroll (ex. GST)', merged.labourExGST, '$', isAuto('labourExGST'))}
+
+    <div class="section-label">Labour (inc. GST)</div>
+    ${field('labourInc', 'Labour — Wages, Super and Payroll (inc. GST)', merged.labourInc, '$', false)}
+
     <div class="section-label">Transactions</div>
     ${field('transactions', 'Number of Transactions', merged.transactions, '#', isAuto('transactions'))}
 
     ${Object.keys(state.autoFields).length > 0 ? '<div class="green-note">✓ Green fields auto-filled. You can still edit them.</div>' : ''}
     <div class="mt-14"><button class="btn btn-dark" onclick="setState({step:'report'})">Generate Report →</button></div>`;
 
-  // Bind week label field
   const wl = document.getElementById('field-weekLabel');
   if (wl) wl.oninput = e => setState({ weekLabel: e.target.value });
 }
@@ -324,22 +270,6 @@ function applyInvoiceToCOGS() {
     }
   });
   addLog(`✓ Applied: Coffee COGS +${fmt(invCoffee)}, Food COGS +${fmt(invFood)}`);
-}
-
-async function fetchXeroLabour() {
-  if (!state.fromDate || !state.toDate) { addLog('⚠ Enter From and To dates first'); return; }
-  setState({ xeroLoading: true });
-  addLog(`Fetching labour from Xero (${state.fromDate} → ${state.toDate})…`);
-  try {
-    const res = await fetch(`/api/xero-labour?fromDate=${state.fromDate}&toDate=${state.toDate}`);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error);
-    setState({ autoFields: { ...state.autoFields, labourExGST: data.labourExGST.toFixed(2) }, xeroLoading: false });
-    addLog(`✓ Xero labour: ${fmt(data.labourExGST)} ex-GST`);
-  } catch (e) {
-    addLog(`✗ Xero error: ${e.message}`);
-    setState({ xeroLoading: false });
-  }
 }
 
 async function handlePDFs(files) {
@@ -401,20 +331,6 @@ async function generateAI() {
   } catch {
     setState({ aiError: 'Failed — please try again.', aiLoading: false });
   }
-}
-
-// Check Xero callback on load
-const params = new URLSearchParams(window.location.search);
-if (params.get('xero') === 'connected') {
-  state.xeroStatus = 'connected';
-  state.tab = 'import';
-  state.log = ['✓ Xero connected successfully'];
-  window.history.replaceState({}, '', '/');
-} else if (params.get('xero') === 'error') {
-  state.xeroStatus = 'error';
-  state.tab = 'import';
-  state.log = ['✗ Xero connection failed — please try again'];
-  window.history.replaceState({}, '', '/');
 }
 
 render();
