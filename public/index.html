@@ -28,6 +28,7 @@
     .btn-outline { background: #fff; color: #1a1a2e; border: 1px solid #ccc; }
     .btn-green { background: #16a34a; color: #fff; }
     .btn-xero { background: #13B5EA; color: #fff; }
+    .btn-retry { background: #f59e0b; color: #fff; }
     .btn-sm { font-size: 12px; padding: 6px 12px; }
     .btn:disabled { opacity: 0.6; cursor: not-allowed; }
     .import-box { border-radius: 9px; padding: 12px; margin-bottom: 10px; }
@@ -67,6 +68,7 @@
     hr { border: none; border-top: 1px solid #eee; margin: 12px 0; }
     .green-note { font-size: 11px; color: #16a34a; margin-bottom: 8px; }
     .error-note { color: red; font-size: 12px; margin-top: 6px; }
+    .error-banner { background: #fef2f2; border: 1px solid #fca5a5; border-radius: 8px; padding: 10px 12px; font-size: 12px; color: #dc2626; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
     .date-input { border: 1px solid #ddd; border-radius: 5px; padding: 5px 8px; font-size: 13px; }
   </style>
 </head>
@@ -125,7 +127,8 @@ function field(id, label, value, prefix, readOnly) {
     <label>${label}</label>
     <div class="field-row${isAuto ? ' auto' : ''}">
       <span class="field-prefix">${prefix || '$'}</span>
-      <input type="number" id="field-${id}" value="${value || ''}" placeholder="0.00" min="0" ${readOnly ? 'readonly' : ''} oninput="onField('${id}', this.value)" />
+      <input type="number" id="field-${id}" value="${value || ''}" placeholder="0.00" min="0"
+        ${readOnly ? 'readonly' : ''} oninput="onField('${id}', this.value)" />
       ${isAuto ? '<span class="auto-tag">● auto</span>' : ''}
     </div>
   </div>`;
@@ -146,6 +149,7 @@ function render() {
   const app = document.getElementById('app');
   const c = calc();
 
+  // ---- AI STEP ----
   if (state.step === 'ai') {
     app.innerHTML = `
       <div class="flex align-center gap-8" style="margin-bottom:14px">
@@ -157,11 +161,14 @@ function render() {
     return;
   }
 
+  // ---- REPORT STEP ----
   if (state.step === 'report') {
     app.innerHTML = `
       <div class="flex justify-between align-center" style="margin-bottom:4px">
-        <div><h2 style="margin:0;font-size:19px">Weekly Financial Report</h2>
-        <div class="sub">${state.weekLabel || 'Week ending —'} · All figures ex-GST</div></div>
+        <div>
+          <h2 style="margin:0;font-size:19px">Weekly Financial Report</h2>
+          <div class="sub">${state.weekLabel || 'Week ending —'} · All figures ex-GST</div>
+        </div>
         <button class="btn btn-outline btn-sm" onclick="setState({step:'input'})">← Edit</button>
       </div>
       <hr/>
@@ -188,27 +195,40 @@ function render() {
     return;
   }
 
-  // Input step
+  // ---- INPUT STEP ----
   const merged = c.merged;
   const isAuto = k => state.autoFields[k] !== undefined;
-  const invCoffee = state.invoices.filter(i => i.category === 'coffee').reduce((s, i) => s + (i.total_inc_gst || 0), 0);
-  const invFood = state.invoices.filter(i => i.category === 'food').reduce((s, i) => s + (i.total_inc_gst || 0), 0);
-  const invUncat = state.invoices.filter(i => !i.category);
 
-  const xeroStatusHtml = `<span class="xero-status ${state.xeroStatus === 'connected' ? 'status-connected' : state.xeroStatus === 'error' ? 'status-error' : 'status-disconnected'}">
-    ${state.xeroStatus === 'connected' ? '● Connected' : state.xeroStatus === 'error' ? '● Error' : '○ Not connected'}
-  </span>`;
+  // Xero status and buttons
+  let xeroStatusText = '';
+  let xeroActionBtn = '';
+  if (state.xeroStatus === 'connected') {
+    xeroStatusText = '<span class="xero-status status-connected">● Connected</span>';
+    xeroActionBtn = `<button class="btn btn-outline btn-sm" onclick="setState({xeroStatus:'disconnected'})">Disconnect</button>`;
+  } else if (state.xeroStatus === 'error') {
+    xeroStatusText = '<span class="xero-status status-error">● Connection failed</span>';
+    xeroActionBtn = `<button class="btn btn-retry btn-sm" onclick="window.location.href='/api/xero-auth'">Try Again</button>`;
+  } else {
+    xeroStatusText = '<span class="xero-status status-disconnected">○ Not connected</span>';
+    xeroActionBtn = `<button class="btn btn-xero btn-sm" onclick="window.location.href='/api/xero-auth'">Connect Xero</button>`;
+  }
 
-  const xeroBtn = state.xeroStatus !== 'connected'
-    ? `<button class="btn btn-xero btn-sm" onclick="window.location.href='/api/xero-auth'">Connect Xero</button>`
-    : `<button class="btn btn-outline btn-sm" onclick="setState({xeroStatus:'disconnected'})">Disconnect</button>`;
+  const xeroErrorBanner = state.xeroStatus === 'error' ? `
+    <div class="error-banner">
+      <span>Xero connection failed. This sometimes happens on the first attempt — please try again.</span>
+      <button class="btn btn-retry btn-sm" onclick="window.location.href='/api/xero-auth'">Try Again</button>
+    </div>` : '';
 
   const xeroDatePicker = state.xeroStatus === 'connected' ? `
     <div class="flex gap-8 flex-wrap align-center" style="margin-top:8px">
-      <div><label style="font-size:11px;color:#555;display:block;margin-bottom:2px">From</label>
-        <input type="date" class="date-input" value="${state.fromDate}" onchange="setState({fromDate:this.value})" /></div>
-      <div><label style="font-size:11px;color:#555;display:block;margin-bottom:2px">To</label>
-        <input type="date" class="date-input" value="${state.toDate}" onchange="setState({toDate:this.value})" /></div>
+      <div>
+        <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">From</label>
+        <input type="date" class="date-input" value="${state.fromDate}" onchange="setState({fromDate:this.value})" />
+      </div>
+      <div>
+        <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">To</label>
+        <input type="date" class="date-input" value="${state.toDate}" onchange="setState({toDate:this.value})" />
+      </div>
       <button class="btn btn-xero btn-sm" onclick="fetchXeroLabour()" ${state.xeroLoading ? 'disabled' : ''} style="margin-top:14px">
         ${state.xeroLoading ? 'Fetching…' : 'Fetch Labour'}
       </button>
@@ -220,13 +240,14 @@ function render() {
       ${state.invoices.map(inv => `
         <div class="invoice-row">
           <span>${inv.supplier || inv.file}</span>
-          <span class="flex gap-8 align-center">${fmt(inv.total_inc_gst || 0)}
+          <span class="flex gap-8 align-center">
+            ${fmt(inv.total_inc_gst || 0)}
             <span class="tag ${inv.category === 'coffee' ? 'tag-coffee' : inv.category === 'food' ? 'tag-food' : 'tag-uncat'}">
               ${inv.category || '⚠ uncat'}
             </span>
           </span>
         </div>`).join('')}
-      ${invUncat.length > 0 ? `<div style="font-size:11px;color:#dc2626;margin-top:5px">⚠ ${invUncat.length} invoice(s) need manual categorisation</div>` : ''}
+      ${state.invoices.filter(i => !i.category).length > 0 ? `<div style="font-size:11px;color:#dc2626;margin-top:5px">⚠ Some invoices need manual categorisation below</div>` : ''}
       <div class="flex gap-8 mt-8">
         <button class="btn btn-green btn-sm" onclick="applyInvoiceToCOGS()">Apply to COGS →</button>
         <button class="btn btn-outline btn-sm" onclick="setState({invoices:[]})">Clear</button>
@@ -246,10 +267,11 @@ function render() {
 
     ${state.tab === 'import' ? `
     <div>
+      ${xeroErrorBanner}
       <div class="import-box xero-box">
         <div class="flex justify-between align-center" style="margin-bottom:6px">
           <div class="title">🔵 Xero — Labour Data</div>
-          <div class="flex align-center gap-8">${xeroStatusHtml}${xeroBtn}</div>
+          <div class="flex align-center gap-8">${xeroStatusText}${xeroActionBtn}</div>
         </div>
         <div class="desc">Fetches wages, super and payroll directly from your Xero P&L</div>
         ${xeroDatePicker}
@@ -286,7 +308,7 @@ function render() {
     ${Object.keys(state.autoFields).length > 0 ? '<div class="green-note">✓ Green fields auto-filled. You can still edit them.</div>' : ''}
     <div class="mt-14"><button class="btn btn-dark" onclick="setState({step:'report'})">Generate Report →</button></div>`;
 
-  // Restore week label field binding
+  // Bind week label field
   const wl = document.getElementById('field-weekLabel');
   if (wl) wl.oninput = e => setState({ weekLabel: e.target.value });
 }
@@ -325,9 +347,18 @@ async function handlePDFs(files) {
   const newInvs = [];
   for (const f of Array.from(files)) {
     addLog(`Reading ${f.name}…`);
-    const b64 = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result.split(',')[1]); r.onerror = rej; r.readAsDataURL(f); });
+    const b64 = await new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload = () => res(r.result.split(',')[1]);
+      r.onerror = rej;
+      r.readAsDataURL(f);
+    });
     try {
-      const res = await fetch('/api/parse-invoice', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ base64: b64, filename: f.name }) });
+      const res = await fetch('/api/parse-invoice', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ base64: b64, filename: f.name })
+      });
       const inv = await res.json();
       newInvs.push(inv);
       addLog(`✓ ${inv.supplier || f.name} — ${fmt(inv.total_inc_gst || 0)} (${inv.category || '⚠ unrecognised'})`);
@@ -346,7 +377,8 @@ async function handleLightspeed(files) {
     let coffeeInc = 0, foodInc = 0, transactions = 0;
     for (const row of rows) {
       const cat = String(row[0] || '').toLowerCase();
-      const rev = parseFloat(row[1]) || 0; const txn = parseInt(row[2]) || 0;
+      const rev = parseFloat(row[1]) || 0;
+      const txn = parseInt(row[2]) || 0;
       if (cat.includes('coffee') || cat.includes('bev')) { coffeeInc += rev; transactions += txn; }
       else if (cat.includes('food') || cat.includes('kitchen')) { foodInc += rev; transactions += txn; }
     }
@@ -360,18 +392,30 @@ async function generateAI() {
   const c = calc();
   try {
     const res = await fetch('/api/generate-report', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ weekLabel: state.weekLabel, ...c })
     });
     const data = await res.json();
     setState({ aiReport: data.report || '', step: 'ai', aiLoading: false });
-  } catch { setState({ aiError: 'Failed — please try again.', aiLoading: false }); }
+  } catch {
+    setState({ aiError: 'Failed — please try again.', aiLoading: false });
+  }
 }
 
 // Check Xero callback on load
 const params = new URLSearchParams(window.location.search);
-if (params.get('xero') === 'connected') { state.xeroStatus = 'connected'; state.log = ['✓ Xero connected successfully']; window.history.replaceState({}, '', '/'); }
-else if (params.get('xero') === 'error') { state.xeroStatus = 'error'; state.log = ['✗ Xero connection failed']; window.history.replaceState({}, '', '/'); }
+if (params.get('xero') === 'connected') {
+  state.xeroStatus = 'connected';
+  state.tab = 'import';
+  state.log = ['✓ Xero connected successfully'];
+  window.history.replaceState({}, '', '/');
+} else if (params.get('xero') === 'error') {
+  state.xeroStatus = 'error';
+  state.tab = 'import';
+  state.log = ['✗ Xero connection failed — please try again'];
+  window.history.replaceState({}, '', '/');
+}
 
 render();
 </script>
