@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Weekly Finance Report</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+    .card { background: #fff; border-radius: 12px; padding: 24px; max-width: 560px; margin: 0 auto; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+    h2 { margin: 0 0 4px; font-size: 20px; }
+    .sub { color: #888; font-size: 12px; margin: 0 0 16px; }
+    .section-label { font-weight: 700; font-size: 11px; color: #333; margin: 14px 0 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .field { margin-bottom: 9px; }
+    .field label { display: block; font-size: 11px; color: #555; margin-bottom: 2px; }
+    .field-row { display: flex; align-items: center; border: 1px solid #ddd; border-radius: 6px; overflow: hidden; background: #fff; }
+    .field-row.auto { border-color: #b7e2c8; background: #f0faf4; }
+    .field-prefix { padding: 7px 9px; background: #f4f4f4; color: #888; font-size: 12px; }
+    .field-row.auto .field-prefix { background: #d1f5e0; }
+    .field-row input { flex: 1; border: none; padding: 7px 9px; font-size: 13px; outline: none; background: transparent; }
+    .auto-tag { font-size: 10px; color: #16a34a; padding: 0 8px; white-space: nowrap; }
+    .tabs { display: flex; margin-bottom: 16px; border-radius: 7px; overflow: hidden; border: 1px solid #ddd; }
+    .tab-btn { flex: 1; padding: 9px 0; background: #f4f4f4; color: #555; border: none; cursor: pointer; font-weight: 600; font-size: 13px; }
+    .tab-btn.active { background: #1a1a2e; color: #fff; }
+    .btn { border: none; border-radius: 7px; cursor: pointer; font-weight: 600; font-size: 14px; padding: 11px 20px; }
+    .btn-dark { background: #1a1a2e; color: #fff; }
+    .btn-outline { background: #fff; color: #1a1a2e; border: 1px solid #ccc; }
+    .btn-green { background: #16a34a; color: #fff; }
+    .btn-xero { background: #13B5EA; color: #fff; }
+    .btn-sm { font-size: 12px; padding: 6px 12px; }
+    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    .import-box { border-radius: 9px; padding: 12px; margin-bottom: 10px; }
+    .import-box .title { font-weight: 700; font-size: 13px; margin-bottom: 4px; }
+    .import-box .desc { font-size: 12px; color: #666; margin-bottom: 8px; }
+    .xero-box { background: #f0f9ff; border: 1px solid #bae6fd; }
+    .ls-box { background: #f8f9ff; border: 1px solid #dde; }
+    .pdf-box { background: #fff8f0; border: 1px solid #f0d8b0; }
+    .log-box { background: #111; color: #7eff9a; border-radius: 8px; padding: 10px 12px; font-size: 11px; font-family: monospace; max-height: 100px; overflow-y: auto; margin-top: 8px; }
+    .kpi-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin-bottom: 9px; }
+    .kpi-grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 9px; margin-bottom: 9px; }
+    .kpi-card { border: 1px solid #e0e0e0; border-radius: 10px; padding: 12px 14px; }
+    .kpi-card.highlight { background: #1a1a2e; color: #fff; }
+    .kpi-label { font-size: 10px; color: #888; margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .kpi-card.highlight .kpi-label { color: #aab; }
+    .kpi-value { font-size: 19px; font-weight: 700; }
+    .kpi-sub { font-size: 10px; color: #999; margin-top: 2px; }
+    .kpi-card.highlight .kpi-sub { color: #ccd; }
+    .invoice-row { display: flex; justify-content: space-between; align-items: center; font-size: 12px; padding: 4px 0; border-bottom: 1px solid #f0e0c8; }
+    .tag { font-size: 11px; padding: 2px 8px; border-radius: 20px; font-weight: 600; }
+    .tag-coffee { background: #7c3aed20; color: #7c3aed; }
+    .tag-food { background: #16a34a20; color: #16a34a; }
+    .tag-uncat { background: #dc262620; color: #dc2626; }
+    .ai-box { background: #f9f9fb; border: 1px solid #e0e0e0; border-radius: 12px; padding: 20px; font-size: 13px; color: #333; line-height: 1.75; }
+    .xero-status { font-size: 11px; }
+    .status-connected { color: #16a34a; }
+    .status-error { color: #dc2626; }
+    .status-disconnected { color: #888; }
+    .flex { display: flex; }
+    .gap-8 { gap: 8px; }
+    .align-center { align-items: center; }
+    .justify-between { justify-content: space-between; }
+    .flex-wrap { flex-wrap: wrap; }
+    .mt-8 { margin-top: 8px; }
+    .mt-14 { margin-top: 14px; }
+    .hidden { display: none; }
+    hr { border: none; border-top: 1px solid #eee; margin: 12px 0; }
+    .green-note { font-size: 11px; color: #16a34a; margin-bottom: 8px; }
+    .error-note { color: red; font-size: 12px; margin-top: 6px; }
+    .date-input { border: 1px solid #ddd; border-radius: 5px; padding: 5px 8px; font-size: 13px; }
+  </style>
+</head>
+<body>
+<div class="card" id="app"></div>
+
+<script>
+const GST = 0.1;
+const exGST = v => v / (1 + GST);
+const fmt = n => '$' + Number(n).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const pct = (a, b) => b === 0 ? '—' : ((a / b) * 100).toFixed(1) + '%';
+const SUPPLIERS = { stel: 'coffee', norkatu: 'coffee', moco: 'food', fresho: 'food', 'big michaels': 'food', 'coca cola': 'food', 'coca-cola': 'food', ordermentum: 'food' };
+const categFromSupplier = name => { const l = (name || '').toLowerCase(); for (const [k, v] of Object.entries(SUPPLIERS)) if (l.includes(k)) return v; return null; };
+
+let state = {
+  step: 'input', tab: 'manual',
+  weekLabel: '', fromDate: '', toDate: '',
+  inputs: { turnoverCoffeeInc: '', turnoverFoodInc: '', cogsCoffeeInc: '', cogsFoodInc: '', labourExGST: '', transactions: '' },
+  autoFields: {}, invoices: [], log: [],
+  xeroStatus: 'disconnected', xeroLoading: false,
+  aiReport: '', aiLoading: false, aiError: '', parsing: false
+};
+
+function setState(updates) { state = { ...state, ...updates }; render(); }
+function addLog(msg) { setState({ log: [...state.log, msg] }); }
+
+function calc() {
+  const merged = { ...state.inputs, ...state.autoFields };
+  const n = k => parseFloat(merged[k]) || 0;
+  const coffeeEx = exGST(n('turnoverCoffeeInc'));
+  const foodEx = exGST(n('turnoverFoodInc'));
+  const cogsCoEx = exGST(n('cogsCoffeeInc'));
+  const cogsFdEx = exGST(n('cogsFoodInc'));
+  const labourEx = n('labourExGST');
+  const txns = n('transactions');
+  const total = coffeeEx + foodEx;
+  const totalCOGS = cogsCoEx + cogsFdEx;
+  const gp = total - totalCOGS;
+  const gpPct = total > 0 ? (gp / total) * 100 : 0;
+  const labourPct = total > 0 ? (labourEx / total) * 100 : 0;
+  const avg = txns > 0 ? total / txns : 0;
+  return { coffeeEx, foodEx, cogsCoEx, cogsFdEx, labourEx, txns, total, totalCOGS, gp, gpPct, labourPct, avg, merged };
+}
+
+function kpiCard(label, value, sub, highlight) {
+  return `<div class="kpi-card${highlight ? ' highlight' : ''}">
+    <div class="kpi-label">${label}</div>
+    <div class="kpi-value">${value}</div>
+    ${sub ? `<div class="kpi-sub">${sub}</div>` : ''}
+  </div>`;
+}
+
+function field(id, label, value, prefix, readOnly) {
+  const isAuto = readOnly && state.autoFields[id] !== undefined;
+  return `<div class="field">
+    <label>${label}</label>
+    <div class="field-row${isAuto ? ' auto' : ''}">
+      <span class="field-prefix">${prefix || '$'}</span>
+      <input type="number" id="field-${id}" value="${value || ''}" placeholder="0.00" min="0" ${readOnly ? 'readonly' : ''} oninput="onField('${id}', this.value)" />
+      ${isAuto ? '<span class="auto-tag">● auto</span>' : ''}
+    </div>
+  </div>`;
+}
+
+function onField(id, val) {
+  const newInputs = { ...state.inputs, [id]: val };
+  const newAuto = { ...state.autoFields };
+  if (newAuto[id] !== undefined) delete newAuto[id];
+  setState({ inputs: newInputs, autoFields: newAuto });
+}
+
+function renderBold(txt) {
+  return txt.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+}
+
+function render() {
+  const app = document.getElementById('app');
+  const c = calc();
+
+  if (state.step === 'ai') {
+    app.innerHTML = `
+      <div class="flex align-center gap-8" style="margin-bottom:14px">
+        <button class="btn btn-outline btn-sm" onclick="setState({step:'report'})">← Back</button>
+        <h2 style="margin:0;font-size:17px">AI Analysis — ${state.weekLabel || 'This Week'}</h2>
+      </div>
+      <div class="ai-box">${state.aiReport.split('\n').map(l => `<p style="margin:5px 0">${renderBold(l)}</p>`).join('')}</div>
+      <div class="mt-14"><button class="btn btn-dark" onclick="setState({step:'input',aiReport:''})">New Report</button></div>`;
+    return;
+  }
+
+  if (state.step === 'report') {
+    app.innerHTML = `
+      <div class="flex justify-between align-center" style="margin-bottom:4px">
+        <div><h2 style="margin:0;font-size:19px">Weekly Financial Report</h2>
+        <div class="sub">${state.weekLabel || 'Week ending —'} · All figures ex-GST</div></div>
+        <button class="btn btn-outline btn-sm" onclick="setState({step:'input'})">← Edit</button>
+      </div>
+      <hr/>
+      <div class="kpi-grid-2">
+        ${kpiCard('Turnover — Coffee', fmt(c.coffeeEx), pct(c.coffeeEx, c.total) + ' of total')}
+        ${kpiCard('Turnover — Food & Bev', fmt(c.foodEx), pct(c.foodEx, c.total) + ' of total')}
+        ${kpiCard('COGS — Coffee', fmt(c.cogsCoEx), pct(c.cogsCoEx, c.coffeeEx) + ' COGS ratio')}
+        ${kpiCard('COGS — Food & Bev', fmt(c.cogsFdEx), pct(c.cogsFdEx, c.foodEx) + ' COGS ratio')}
+      </div>
+      <div class="kpi-grid-3">
+        ${kpiCard('Total Turnover', fmt(c.total), '', true)}
+        ${kpiCard('Gross Profit', fmt(c.gp), 'Margin: ' + c.gpPct.toFixed(1) + '%', true)}
+        ${kpiCard('Total COGS', fmt(c.totalCOGS), pct(c.totalCOGS, c.total) + ' of revenue', true)}
+      </div>
+      <div class="kpi-grid-3">
+        ${kpiCard('Labour', fmt(c.labourEx), c.labourPct.toFixed(1) + '% of turnover')}
+        ${kpiCard('Transactions', c.txns.toLocaleString())}
+        ${kpiCard('Avg Customer Spend', fmt(c.avg), 'ex-GST per transaction')}
+      </div>
+      <button class="btn btn-dark" onclick="generateAI()" ${state.aiLoading ? 'disabled' : ''}>
+        ${state.aiLoading ? 'Generating…' : '✦ Generate AI Performance Analysis'}
+      </button>
+      ${state.aiError ? `<div class="error-note">${state.aiError}</div>` : ''}`;
+    return;
+  }
+
+  // Input step
+  const merged = c.merged;
+  const isAuto = k => state.autoFields[k] !== undefined;
+  const invCoffee = state.invoices.filter(i => i.category === 'coffee').reduce((s, i) => s + (i.total_inc_gst || 0), 0);
+  const invFood = state.invoices.filter(i => i.category === 'food').reduce((s, i) => s + (i.total_inc_gst || 0), 0);
+  const invUncat = state.invoices.filter(i => !i.category);
+
+  const xeroStatusHtml = `<span class="xero-status ${state.xeroStatus === 'connected' ? 'status-connected' : state.xeroStatus === 'error' ? 'status-error' : 'status-disconnected'}">
+    ${state.xeroStatus === 'connected' ? '● Connected' : state.xeroStatus === 'error' ? '● Error' : '○ Not connected'}
+  </span>`;
+
+  const xeroBtn = state.xeroStatus !== 'connected'
+    ? `<button class="btn btn-xero btn-sm" onclick="window.location.href='/api/xero-auth'">Connect Xero</button>`
+    : `<button class="btn btn-outline btn-sm" onclick="setState({xeroStatus:'disconnected'})">Disconnect</button>`;
+
+  const xeroDatePicker = state.xeroStatus === 'connected' ? `
+    <div class="flex gap-8 flex-wrap align-center" style="margin-top:8px">
+      <div><label style="font-size:11px;color:#555;display:block;margin-bottom:2px">From</label>
+        <input type="date" class="date-input" value="${state.fromDate}" onchange="setState({fromDate:this.value})" /></div>
+      <div><label style="font-size:11px;color:#555;display:block;margin-bottom:2px">To</label>
+        <input type="date" class="date-input" value="${state.toDate}" onchange="setState({toDate:this.value})" /></div>
+      <button class="btn btn-xero btn-sm" onclick="fetchXeroLabour()" ${state.xeroLoading ? 'disabled' : ''} style="margin-top:14px">
+        ${state.xeroLoading ? 'Fetching…' : 'Fetch Labour'}
+      </button>
+    </div>` : '';
+
+  const invoiceHtml = state.invoices.length > 0 ? `
+    <div style="margin-top:10px">
+      <div style="font-size:11px;font-weight:600;color:#555;margin-bottom:4px">Parsed Invoices:</div>
+      ${state.invoices.map(inv => `
+        <div class="invoice-row">
+          <span>${inv.supplier || inv.file}</span>
+          <span class="flex gap-8 align-center">${fmt(inv.total_inc_gst || 0)}
+            <span class="tag ${inv.category === 'coffee' ? 'tag-coffee' : inv.category === 'food' ? 'tag-food' : 'tag-uncat'}">
+              ${inv.category || '⚠ uncat'}
+            </span>
+          </span>
+        </div>`).join('')}
+      ${invUncat.length > 0 ? `<div style="font-size:11px;color:#dc2626;margin-top:5px">⚠ ${invUncat.length} invoice(s) need manual categorisation</div>` : ''}
+      <div class="flex gap-8 mt-8">
+        <button class="btn btn-green btn-sm" onclick="applyInvoiceToCOGS()">Apply to COGS →</button>
+        <button class="btn btn-outline btn-sm" onclick="setState({invoices:[]})">Clear</button>
+      </div>
+    </div>` : '';
+
+  app.innerHTML = `
+    <h2 style="margin:0 0 3px;font-size:19px">Weekly Financial Report</h2>
+    <p class="sub">Revenue and COGS fields accept inc. GST — ex-GST calculated automatically.</p>
+
+    ${field('weekLabel', 'Week Ending (e.g. 06 Apr 2025)', state.weekLabel, '📅', false)}
+
+    <div class="tabs">
+      <button class="tab-btn ${state.tab === 'manual' ? 'active' : ''}" onclick="setState({tab:'manual'})">✏️ Manual Entry</button>
+      <button class="tab-btn ${state.tab === 'import' ? 'active' : ''}" onclick="setState({tab:'import'})">📂 Import Data</button>
+    </div>
+
+    ${state.tab === 'import' ? `
+    <div>
+      <div class="import-box xero-box">
+        <div class="flex justify-between align-center" style="margin-bottom:6px">
+          <div class="title">🔵 Xero — Labour Data</div>
+          <div class="flex align-center gap-8">${xeroStatusHtml}${xeroBtn}</div>
+        </div>
+        <div class="desc">Fetches wages, super and payroll directly from your Xero P&L</div>
+        ${xeroDatePicker}
+      </div>
+      <div class="import-box ls-box">
+        <div class="title">📊 Lightspeed Excel Report</div>
+        <div class="desc">Imports Turnover (Coffee and Food) and Transactions</div>
+        <input type="file" id="ls-file" accept=".xlsx,.xls,.csv" class="hidden" onchange="handleLightspeed(this.files)" />
+        <button class="btn btn-outline btn-sm" onclick="document.getElementById('ls-file').click()">Upload Lightspeed Export</button>
+      </div>
+      <div class="import-box pdf-box">
+        <div class="title">🧾 Supplier Invoices (PDF)</div>
+        <div class="desc">Auto-recognises: <b>Stel, Norkatu</b> (Coffee) · <b>Moco, Fresho, Big Michaels, Coca-Cola, Ordermentum</b> (Food)</div>
+        <input type="file" id="pdf-files" accept="application/pdf" multiple class="hidden" onchange="handlePDFs(this.files)" />
+        <button class="btn btn-outline btn-sm" onclick="document.getElementById('pdf-files').click()" ${state.parsing ? 'disabled' : ''}>
+          ${state.parsing ? 'Reading PDFs…' : 'Upload Invoice PDFs'}
+        </button>
+        ${invoiceHtml}
+      </div>
+      ${state.log.length > 0 ? `<div class="log-box">${state.log.map(l => `<div>${l}</div>`).join('')}</div>` : ''}
+    </div>` : ''}
+
+    <div class="section-label">Revenue (inc. GST)</div>
+    ${field('turnoverCoffeeInc', 'Turnover — Coffee (inc. GST)', merged.turnoverCoffeeInc, '$', isAuto('turnoverCoffeeInc'))}
+    ${field('turnoverFoodInc', 'Turnover — Food & Bev (inc. GST)', merged.turnoverFoodInc, '$', isAuto('turnoverFoodInc'))}
+    <div class="section-label">COGS (inc. GST)</div>
+    ${field('cogsCoffeeInc', 'COGS — Coffee (inc. GST)', merged.cogsCoffeeInc, '$', isAuto('cogsCoffeeInc'))}
+    ${field('cogsFoodInc', 'COGS — Food & Bev (inc. GST)', merged.cogsFoodInc, '$', isAuto('cogsFoodInc'))}
+    <div class="section-label">Labour (ex. GST — from Xero)</div>
+    ${field('labourExGST', 'Labour — Wages, Super and Payroll (ex. GST)', merged.labourExGST, '$', isAuto('labourExGST'))}
+    <div class="section-label">Transactions</div>
+    ${field('transactions', 'Number of Transactions', merged.transactions, '#', isAuto('transactions'))}
+
+    ${Object.keys(state.autoFields).length > 0 ? '<div class="green-note">✓ Green fields auto-filled. You can still edit them.</div>' : ''}
+    <div class="mt-14"><button class="btn btn-dark" onclick="setState({step:'report'})">Generate Report →</button></div>`;
+
+  // Restore week label field binding
+  const wl = document.getElementById('field-weekLabel');
+  if (wl) wl.oninput = e => setState({ weekLabel: e.target.value });
+}
+
+function applyInvoiceToCOGS() {
+  const invCoffee = state.invoices.filter(i => i.category === 'coffee').reduce((s, i) => s + (i.total_inc_gst || 0), 0);
+  const invFood = state.invoices.filter(i => i.category === 'food').reduce((s, i) => s + (i.total_inc_gst || 0), 0);
+  setState({
+    autoFields: {
+      ...state.autoFields,
+      cogsCoffeeInc: ((parseFloat(state.autoFields.cogsCoffeeInc) || 0) + invCoffee).toFixed(2),
+      cogsFoodInc: ((parseFloat(state.autoFields.cogsFoodInc) || 0) + invFood).toFixed(2),
+    }
+  });
+  addLog(`✓ Applied: Coffee COGS +${fmt(invCoffee)}, Food COGS +${fmt(invFood)}`);
+}
+
+async function fetchXeroLabour() {
+  if (!state.fromDate || !state.toDate) { addLog('⚠ Enter From and To dates first'); return; }
+  setState({ xeroLoading: true });
+  addLog(`Fetching labour from Xero (${state.fromDate} → ${state.toDate})…`);
+  try {
+    const res = await fetch(`/api/xero-labour?fromDate=${state.fromDate}&toDate=${state.toDate}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error);
+    setState({ autoFields: { ...state.autoFields, labourExGST: data.labourExGST.toFixed(2) }, xeroLoading: false });
+    addLog(`✓ Xero labour: ${fmt(data.labourExGST)} ex-GST`);
+  } catch (e) {
+    addLog(`✗ Xero error: ${e.message}`);
+    setState({ xeroLoading: false });
+  }
+}
+
+async function handlePDFs(files) {
+  setState({ parsing: true });
+  const newInvs = [];
+  for (const f of Array.from(files)) {
+    addLog(`Reading ${f.name}…`);
+    const b64 = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result.split(',')[1]); r.onerror = rej; r.readAsDataURL(f); });
+    try {
+      const res = await fetch('/api/parse-invoice', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ base64: b64, filename: f.name }) });
+      const inv = await res.json();
+      newInvs.push(inv);
+      addLog(`✓ ${inv.supplier || f.name} — ${fmt(inv.total_inc_gst || 0)} (${inv.category || '⚠ unrecognised'})`);
+    } catch { addLog(`✗ ${f.name} — failed`); }
+  }
+  setState({ invoices: [...state.invoices, ...newInvs], parsing: false });
+}
+
+async function handleLightspeed(files) {
+  const f = files[0]; if (!f) return;
+  try {
+    const buf = await f.arrayBuffer();
+    const wb = XLSX.read(buf, { type: 'array' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1 });
+    let coffeeInc = 0, foodInc = 0, transactions = 0;
+    for (const row of rows) {
+      const cat = String(row[0] || '').toLowerCase();
+      const rev = parseFloat(row[1]) || 0; const txn = parseInt(row[2]) || 0;
+      if (cat.includes('coffee') || cat.includes('bev')) { coffeeInc += rev; transactions += txn; }
+      else if (cat.includes('food') || cat.includes('kitchen')) { foodInc += rev; transactions += txn; }
+    }
+    setState({ autoFields: { ...state.autoFields, turnoverCoffeeInc: coffeeInc.toFixed(2), turnoverFoodInc: foodInc.toFixed(2), transactions: transactions || '' } });
+    addLog(`✓ Lightspeed imported successfully`);
+  } catch { addLog('✗ Could not parse Lightspeed file'); }
+}
+
+async function generateAI() {
+  setState({ aiLoading: true, aiError: '' });
+  const c = calc();
+  try {
+    const res = await fetch('/api/generate-report', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ weekLabel: state.weekLabel, ...c })
+    });
+    const data = await res.json();
+    setState({ aiReport: data.report || '', step: 'ai', aiLoading: false });
+  } catch { setState({ aiError: 'Failed — please try again.', aiLoading: false }); }
+}
+
+// Check Xero callback on load
+const params = new URLSearchParams(window.location.search);
+if (params.get('xero') === 'connected') { state.xeroStatus = 'connected'; state.log = ['✓ Xero connected successfully']; window.history.replaceState({}, '', '/'); }
+else if (params.get('xero') === 'error') { state.xeroStatus = 'error'; state.log = ['✗ Xero connection failed']; window.history.replaceState({}, '', '/'); }
+
+render();
+</script>
+</body>
+</html>
