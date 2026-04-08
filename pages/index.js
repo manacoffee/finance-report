@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic';
+export const runtime = 'nodejs';
 import { useState, useRef, useEffect } from 'react';
 import * as XLSX from 'xlsx';
 import Head from 'next/head';
