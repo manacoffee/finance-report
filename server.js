@@ -336,7 +336,7 @@ app.get('/sse', (req, res) => {
   res.flushHeaders();
   mcpSessions.set(sessionId, res);
   console.log(`MCP session opened: ${sessionId}`);
-  res.write(`event: endpoint\ndata: ${JSON.stringify({ uri: `/messages?sessionId=${sessionId}` })}\n\n`);
+  res.write(`event: endpoint\ndata: /messages?sessionId=${sessionId}\n\n`);
   const ping = setInterval(() => { if (!res.writableEnded) res.write(': ping\n\n'); else clearInterval(ping); }, 30_000);
   req.on('close', () => { mcpSessions.delete(sessionId); clearInterval(ping); console.log(`MCP session closed: ${sessionId}`); });
 });
