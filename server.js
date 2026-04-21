@@ -5,7 +5,14 @@ const path = require('path');
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
-
+app.get('/api/debug', (req, res) => {
+  res.json({
+    clientIdLength: (process.env.XERO_CLIENT_ID || '').length,
+    clientIdStart: (process.env.XERO_CLIENT_ID || '').slice(0, 4),
+    redirectUri: process.env.XERO_REDIRECT_URI,
+    hasSecret: !!process.env.XERO_CLIENT_SECRET,
+  });
+});
 // ---- Xero OAuth ----
 app.get('/api/xero-auth', (req, res) => {
   const params = new URLSearchParams({
