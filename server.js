@@ -12,7 +12,7 @@ app.get('/api/xero-auth', (req, res) => {
     response_type: 'code',
     client_id: process.env.XERO_CLIENT_ID,
     redirect_uri: process.env.XERO_REDIRECT_URI,
-    scope: 'openid profile email offline_access accounting.reports.read',
+    scope: 'openid profile email offline_access accounting.invoices accounting.reports.profitandloss.read accounting.attachments',
     state: 'finance_report',
   });
   res.redirect(`https://login.xero.com/identity/connect/authorize?${params}`);
