@@ -269,7 +269,7 @@ app.post('/api/xero-create-bill', async (req, res) => {
     if (!contact) return res.status(404).json({ error: `Supplier "${supplierName}" not found in Xero contacts.` });
     const r = await axios.post(
       'https://api.xero.com/api.xro/2.0/Invoices',
-      { Invoices: [{ Type: 'ACCPAY', Contact: { ContactID: contact.ContactID }, InvoiceNumber: invoiceNumber, Date: invoiceDate, DueDate: dueDate || null, Status: 'DRAFT', LineAmountTypes: 'EXCLUSIVE',
+      { Invoices: [{ Type: 'ACCPAY', Contact: { ContactID: contact.ContactID }, InvoiceNumber: invoiceNumber, Date: invoiceDate, DueDate: dueDate || null, Status: 'DRAFT', LineAmountTypes: 'Exclusive',
         LineItems: lineItems.map(li => ({ Description: li.description, Quantity: Number(li.quantity) || 1, UnitAmount: Number(li.unitAmount), AccountCode: String(li.accountCode), TaxType: li.taxType || 'INPUT2' })) }] },
       { headers: xeroHeaders(token, tenantId) }
     );
