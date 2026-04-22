@@ -398,6 +398,73 @@ app.post('/api/xero-create-spend-money', async (req, res) => {
   }
 });
 
+app.post('/api/xero-create-spend-money', async (req, res) => {
+  console.log('═══ CREATE SPEND MONEY REQUEST ═══');
+  console.log(JSON.stringify(req.body, null, 2));
+  console.log('══════════════════════════════════');
+  const { payeeName, transactionDate, reference, bankAccountCode, lineItems } = req.body;
+  if (!payeeName || !transactionDate || !lineItems?.length) {
+    return res.status(400).json({ error: 'payeeName, transactionDate, and lineItems are required' });
+  }
+  try {
+    const { token, tenantId } = await getValidToken();
+
+    // Find or create contact for the payee
+    const contactRes = await axios.get(
+      `https://api.xero.com/api.xro/2.0/Contacts?searchTerm=${encodeURIComponent(payeeName)}`,
+      { headers: xeroHeaders(token, tenantId) }
+    );
+    let contact = contactRes.data.Contacts?.[0];
+    if (!contact) {
+      const newContactRes = await axios.post(
+        'https://api.xero.com/api.xro/2.0/Contacts',
+        { Contacts: [{ Name: payeeName }] },
+        { headers: xeroHeaders(token, tenantId) }
+      );
+      contact = newContactRes.data.Contacts?.[0];
+    }
+
+    const r = await axios.post(
+      'https://api.xero.com/api.xro/2.0/BankTransactions',
+      { BankTransactions: [{
+        Type: 'SPEND',
+        Contact: { ContactID: contact.ContactID },
+        Date: transactionDate,
+        Reference: reference || undefined,
+        Status: 'AUTHORISED',
+        LineAmountTypes: 'Exclusive',
+        BankAccount: { Code: String(bankAccountCode || '605') },
+        LineItems: lineItems.map(li => ({
+          Description: li.description,
+          Quantity: Number(li.quantity) || 1,
+          UnitAmount: Number(li.unitAmount),
+          AccountCode: String(li.accountCode),
+          TaxType: li.taxType || 'INPUT'
+        }))
+      }] },
+      { headers: xeroHeaders(token, tenantId) }
+    );
+    const created = r.data.BankTransactions?.[0];
+    res.json({
+      success: true,
+      bankTransactionId: created?.BankTransactionID,
+      status: created?.Status,
+      total: created?.Total
+    });
+  } catch (err) {
+    console.error('═══ CREATE SPEND MONEY ERROR ═══');
+    console.error('Status:', err.response?.status);
+    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
+    console.error('Message:', err.message);
+    console.error('════════════════════════════════');
+    res.status(500).json({
+      error: err.response?.data?.Message || err.message,
+      xeroResponse: err.response?.data,
+      xeroStatus: err.response?.status
+    });
+  }
+});
+
 app.post('/api/xero-attach-receipt-spend-money', async (req, res) => {
   const { bankTransactionId, filename, base64Content, mimeType } = req.body;
   if (!bankTransactionId || !filename || !base64Content) {
