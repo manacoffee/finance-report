@@ -562,6 +562,28 @@ app.options('/messages', (req, res) => {
   res.sendStatus(204);
 });
 
+app.get('/api/debug', (req, res) => {
+  res.json({
+    clientIdLength: (process.env.XERO_CLIENT_ID || '').length,
+    clientIdStart: (process.env.XERO_CLIENT_ID || '').slice(0, 4),
+    redirectUri: process.env.XERO_REDIRECT_URI,
+    hasSecret: !!process.env.XERO_CLIENT_SECRET,
+    hasStoredRefreshToken: !!xeroStore.refreshToken,
+    tenantId: xeroStore.tenantId,
+  });
+});
+
+app.get('/api/show-refresh-token', (req, res) => {
+  if (!xeroStore.refreshToken) {
+    return res.json({ error: 'No refresh token in memory. Visit /api/xero-auth first.' });
+  }
+  res.json({
+    refreshToken: xeroStore.refreshToken,
+    tenantId: xeroStore.tenantId,
+    instructions: 'Copy these to Railway env vars as XERO_REFRESH_TOKEN and XERO_TENANT_ID, then DELETE this endpoint.',
+  });
+});
+
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 const PORT = process.env.PORT || 3000;
