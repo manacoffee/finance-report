@@ -238,6 +238,8 @@ Provide: 1) 2-sentence executive summary 2) Key highlights 3) Watch points (flag
 });
 
 app.get('/api/xero-check-invoice', async (req, res) => {
+  console.log('═══ CHECK INVOICE REQUEST ═══');
+  console.log('Invoice number:', req.query.invoiceNumber);
   const { invoiceNumber } = req.query;
   if (!invoiceNumber) return res.status(400).json({ error: 'invoiceNumber required' });
   try {
