@@ -268,11 +268,19 @@ app.post('/api/xero-create-bill', async (req, res) => {
     );
     const created = r.data.Invoices?.[0];
     res.json({ success: true, invoiceId: created?.InvoiceID, invoiceNumber: created?.InvoiceNumber, status: created?.Status, total: created?.Total });
-  } catch (err) {
-    res.status(500).json({ error: err.response?.data?.Message || err.message });
+} catch (err) {
+    console.error('═══ CREATE BILL ERROR ═══');
+    console.error('Status:', err.response?.status);
+    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
+    console.error('Message:', err.message);
+    console.error('═════════════════════════');
+    res.status(500).json({ 
+      error: err.response?.data?.Message || err.message,
+      xeroResponse: err.response?.data,
+      xeroStatus: err.response?.status 
+    });
   }
 });
-
 app.post('/api/xero-attach-receipt', async (req, res) => {
   const { billId, filename, base64Content, mimeType } = req.body;
   if (!billId || !filename || !base64Content) return res.status(400).json({ error: 'billId, filename, and base64Content are required' });
