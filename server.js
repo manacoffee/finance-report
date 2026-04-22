@@ -573,17 +573,6 @@ app.get('/api/debug', (req, res) => {
   });
 });
 
-app.get('/api/show-refresh-token', (req, res) => {
-  if (!xeroStore.refreshToken) {
-    return res.json({ error: 'No refresh token in memory. Visit /api/xero-auth first.' });
-  }
-  res.json({
-    refreshToken: xeroStore.refreshToken,
-    tenantId: xeroStore.tenantId,
-    instructions: 'Copy these to Railway env vars as XERO_REFRESH_TOKEN and XERO_TENANT_ID, then DELETE this endpoint.',
-  });
-});
-
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 const PORT = process.env.PORT || 3000;
