@@ -255,6 +255,9 @@ app.get('/api/xero-check-invoice', async (req, res) => {
 });
 
 app.post('/api/xero-create-bill', async (req, res) => {
+  console.log('═══ CREATE BILL REQUEST ═══');
+  console.log(JSON.stringify(req.body, null, 2));
+  console.log('════════════════════════════');
   const { supplierName, invoiceNumber, invoiceDate, dueDate, lineItems } = req.body;
   if (!supplierName || !invoiceNumber || !invoiceDate || !lineItems?.length) {
     return res.status(400).json({ error: 'supplierName, invoiceNumber, invoiceDate, and lineItems are required' });
