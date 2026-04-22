@@ -270,7 +270,7 @@ app.post('/api/xero-create-bill', async (req, res) => {
     const r = await axios.post(
       'https://api.xero.com/api.xro/2.0/Invoices',
       { Invoices: [{ Type: 'ACCPAY', Contact: { ContactID: contact.ContactID }, InvoiceNumber: invoiceNumber, Date: invoiceDate, DueDate: dueDate || null, Status: 'DRAFT', LineAmountTypes: 'Exclusive',
-        LineItems: lineItems.map(li => ({ Description: li.description, Quantity: Number(li.quantity) || 1, UnitAmount: Number(li.unitAmount), AccountCode: String(li.accountCode), TaxType: li.taxType || 'INPUT2' })) }] },
+        LineItems: lineItems.map(li => ({ Description: li.description, Quantity: Number(li.quantity) || 1, UnitAmount: Number(li.unitAmount), AccountCode: String(li.accountCode), TaxType: li.taxType || 'INPUT' })) }] },
       { headers: xeroHeaders(token, tenantId) }
     );
     const created = r.data.Invoices?.[0];
@@ -330,7 +330,7 @@ async function executeTool(name, params) {
   const BASE = `http://localhost:${PORT}`;
   switch (name) {
     case 'check_duplicate_invoice': return (await axios.get(`${BASE}/api/xero-check-invoice?invoiceNumber=${encodeURIComponent(params.invoice_number)}`)).data;
-    case 'create_xero_bill': return (await axios.post(`${BASE}/api/xero-create-bill`, { supplierName: params.supplier_name, invoiceNumber: params.invoice_number, invoiceDate: params.invoice_date, dueDate: params.due_date, lineItems: (params.line_items || []).map(li => ({ description: li.description, quantity: li.quantity || 1, unitAmount: li.unit_amount, accountCode: li.account_code, taxType: li.tax_type || 'INPUT2' })) })).data;
+    case 'create_xero_bill': return (await axios.post(`${BASE}/api/xero-create-bill`, { supplierName: params.supplier_name, invoiceNumber: params.invoice_number, invoiceDate: params.invoice_date, dueDate: params.due_date, lineItems: (params.line_items || []).map(li => ({ description: li.description, quantity: li.quantity || 1, unitAmount: li.unit_amount, accountCode: li.account_code, taxType: li.tax_type || 'INPUT' })) })).data;
     case 'attach_receipt_to_bill': return (await axios.post(`${BASE}/api/xero-attach-receipt`, { billId: params.bill_id, filename: params.filename, base64Content: params.base64_content, mimeType: params.mime_type || 'application/pdf' })).data;
     case 'get_open_bills': { const qs = new URLSearchParams(); if (params.from_date) qs.set('fromDate', params.from_date); if (params.to_date) qs.set('toDate', params.to_date); return (await axios.get(`${BASE}/api/xero-open-bills?${qs}`)).data; }
     default: throw new Error(`Unknown tool: ${name}`);
