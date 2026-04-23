@@ -21,6 +21,12 @@ let xeroStore = {
   expiresAt: 0,
 };
 
+let gmailStore = {
+  accessToken: null,
+  refreshToken: process.env.GMAIL_REFRESH_TOKEN || null,
+  expiresAt: 0,
+};
+
 const mcpSessions = new Map();
 
 async function getValidToken() {
@@ -46,6 +52,41 @@ async function getValidToken() {
   xeroStore.refreshToken = r.data.refresh_token;
   xeroStore.expiresAt = Date.now() + r.data.expires_in * 1_000;
   return { token: xeroStore.accessToken, tenantId: xeroStore.tenantId };
+}
+
+async function getValidGmailToken() {
+  if (gmailStore.accessToken && Date.now() < gmailStore.expiresAt - 60_000) {
+    return gmailStore.accessToken;
+  }
+  if (!gmailStore.refreshToken) {
+    throw new Error('Not connected to Gmail — please visit /api/gmail-auth to connect');
+  }
+  const r = await axios.post(
+    'https://oauth2.googleapis.com/token',
+    new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: gmailStore.refreshToken,
+      client_id: process.env.GMAIL_CLIENT_ID,
+      client_secret: process.env.GMAIL_CLIENT_SECRET,
+    }),
+    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+  );
+  gmailStore.accessToken = r.data.access_token;
+  // Google only returns a new refresh_token occasionally; keep the old one if not returned
+  if (r.data.refresh_token) gmailStore.refreshToken = r.data.refresh_token;
+  gmailStore.expiresAt = Date.now() + r.data.expires_in * 1_000;
+  return gmailStore.accessToken;
+}
+
+function gmailHeaders(token) {
+  return { Authorization: `Bearer ${token}`, Accept: 'application/json' };
+}
+
+// Decode a base64url string into a Buffer. Gmail API returns attachment data
+// and raw message bodies in base64url encoding (RFC 4648 §5).
+function base64urlDecode(str) {
+  const pad = str.length % 4 === 2 ? '==' : str.length % 4 === 3 ? '=' : '';
+  return Buffer.from(str.replace(/-/g, '+').replace(/_/g, '/') + pad, 'base64');
 }
 
 function xeroHeaders(token, tenantId) {
@@ -119,6 +160,61 @@ app.get('/api/xero-callback', async (req, res) => {
   } catch (err) {
     console.error('Xero callback error:', err.response?.data || err.message);
     res.redirect('/?xero=error');
+  }
+});
+
+// ─── Gmail OAuth ──────────────────────────────────────────────────────────
+// Full OAuth 2.0 flow for `brisbane@manacoffee.net`. Used to fetch PDF
+// invoice attachments server-side so Claude doesn't have to pass them
+// through the MCP tool as base64.
+app.get('/api/gmail-auth', (req, res) => {
+  if (!process.env.GMAIL_CLIENT_ID || !process.env.GMAIL_REDIRECT_URI) {
+    return res.status(500).send('Gmail OAuth not configured — GMAIL_CLIENT_ID / GMAIL_REDIRECT_URI env vars missing.');
+  }
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: process.env.GMAIL_CLIENT_ID,
+    redirect_uri: process.env.GMAIL_REDIRECT_URI,
+    scope: 'https://www.googleapis.com/auth/gmail.readonly',
+    access_type: 'offline',
+    prompt: 'consent',         // force refresh_token issuance
+    include_granted_scopes: 'true',
+    state: 'finance_report',
+  });
+  res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params}`);
+});
+
+app.get('/api/gmail-callback', async (req, res) => {
+  const { code, error } = req.query;
+  if (error || !code) return res.redirect('/?gmail=error');
+  try {
+    const tokenRes = await axios.post(
+      'https://oauth2.googleapis.com/token',
+      new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        client_id: process.env.GMAIL_CLIENT_ID,
+        client_secret: process.env.GMAIL_CLIENT_SECRET,
+        redirect_uri: process.env.GMAIL_REDIRECT_URI,
+      }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    const { access_token, refresh_token, expires_in } = tokenRes.data;
+    if (!refresh_token) {
+      // Google only returns refresh_token when prompt=consent AND the user has
+      // not previously granted this scope. If missing, re-consent is required.
+      console.error('Gmail callback: no refresh_token returned. Revoke the app at https://myaccount.google.com/permissions and re-authorise.');
+      return res.redirect('/?gmail=error&reason=no_refresh_token');
+    }
+    gmailStore = {
+      accessToken: access_token,
+      refreshToken: refresh_token,
+      expiresAt: Date.now() + expires_in * 1_000,
+    };
+    res.redirect('/?gmail=connected');
+  } catch (err) {
+    console.error('Gmail callback error:', err.response?.data || err.message);
+    res.redirect('/?gmail=error');
   }
 });
 
@@ -588,6 +684,245 @@ app.post('/api/xero-update-bill', async (req, res) => {
     });
   }
 });
+
+// ─── Gmail helpers (server-side only) ────────────────────────────────────
+// Find Gmail label ID by display name (e.g. "Supplier invoices").
+async function resolveGmailLabelId(labelName) {
+  const token = await getValidGmailToken();
+  const r = await axios.get(
+    'https://gmail.googleapis.com/gmail/v1/users/me/labels',
+    { headers: gmailHeaders(token) }
+  );
+  const match = (r.data.labels || []).find(l => l.name === labelName);
+  if (!match) throw new Error(`Gmail label "${labelName}" not found`);
+  return match.id;
+}
+
+// Walk a Gmail message payload tree to collect attachments.
+function collectAttachments(payload, out = []) {
+  if (!payload) return out;
+  if (payload.filename && payload.body && payload.body.attachmentId) {
+    out.push({
+      filename: payload.filename,
+      mimeType: payload.mimeType,
+      size: payload.body.size || 0,
+      attachmentId: payload.body.attachmentId,
+      partId: payload.partId || null,
+    });
+  }
+  if (Array.isArray(payload.parts)) {
+    payload.parts.forEach(p => collectAttachments(p, out));
+  }
+  return out;
+}
+
+function pickHeader(headers, name) {
+  const h = (headers || []).find(x => (x.name || '').toLowerCase() === name.toLowerCase());
+  return h ? h.value : null;
+}
+
+// ─── Gmail API routes ────────────────────────────────────────────────────
+// List messages under a Gmail label, with attachment metadata. Designed so
+// Claude can ask "what's unprocessed in 'Supplier invoices'?" each Monday.
+app.get('/api/gmail-list-by-label', async (req, res) => {
+  const { label, maxResults } = req.query;
+  if (!label) return res.status(400).json({ error: 'label query param required (e.g. "Supplier invoices")' });
+  try {
+    const token = await getValidGmailToken();
+    const labelId = await resolveGmailLabelId(label);
+    const listRes = await axios.get(
+      `https://gmail.googleapis.com/gmail/v1/users/me/messages?labelIds=${encodeURIComponent(labelId)}&maxResults=${Number(maxResults) || 50}`,
+      { headers: gmailHeaders(token) }
+    );
+    const ids = (listRes.data.messages || []).map(m => m.id);
+    // Fetch each message in parallel — metadata format is lightweight.
+    const messages = await Promise.all(ids.map(async id => {
+      const m = await axios.get(
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`,
+        { headers: gmailHeaders(token) }
+      );
+      const p = m.data.payload || {};
+      const headers = p.headers || [];
+      return {
+        messageId: m.data.id,
+        threadId: m.data.threadId,
+        subject: pickHeader(headers, 'Subject'),
+        from: pickHeader(headers, 'From'),
+        to: pickHeader(headers, 'To'),
+        date: pickHeader(headers, 'Date'),
+        internalDate: m.data.internalDate,
+        snippet: m.data.snippet,
+        attachments: collectAttachments(p),
+      };
+    }));
+    res.json({ label, count: messages.length, messages });
+  } catch (err) {
+    console.error('═══ GMAIL LIST BY LABEL ERROR ═══');
+    console.error('Status:', err.response?.status);
+    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
+    console.error('Message:', err.message);
+    console.error('═════════════════════════════════');
+    res.status(500).json({ error: err.response?.data?.error?.message || err.message });
+  }
+});
+
+// Fetch the raw PDF bytes of a Gmail attachment, attach to a Xero bill.
+// Claude only passes small IDs — the heavy lifting happens server-side.
+async function fetchGmailAttachment(messageId, attachmentId) {
+  const token = await getValidGmailToken();
+  const r = await axios.get(
+    `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}/attachments/${attachmentId}`,
+    { headers: gmailHeaders(token) }
+  );
+  if (!r.data.data) throw new Error('Gmail attachment returned empty data');
+  return base64urlDecode(r.data.data);
+}
+
+async function fetchGmailRawMessage(messageId) {
+  const token = await getValidGmailToken();
+  const r = await axios.get(
+    `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?format=raw`,
+    { headers: gmailHeaders(token) }
+  );
+  if (!r.data.raw) throw new Error('Gmail raw message returned empty data');
+  return base64urlDecode(r.data.raw);
+}
+
+app.post('/api/xero-attach-gmail-pdf-to-bill', async (req, res) => {
+  console.log('═══ ATTACH GMAIL PDF TO BILL ═══');
+  console.log(JSON.stringify(req.body, null, 2));
+  const { billId, gmailMessageId, gmailAttachmentId, filename, mimeType } = req.body;
+  if (!billId || !gmailMessageId || !gmailAttachmentId || !filename) {
+    return res.status(400).json({ error: 'billId, gmailMessageId, gmailAttachmentId, filename are required' });
+  }
+  try {
+    const buffer = await fetchGmailAttachment(gmailMessageId, gmailAttachmentId);
+    const { token, tenantId } = await getValidToken();
+    const r = await axios.post(
+      `https://api.xero.com/api.xro/2.0/Invoices/${billId}/Attachments/${encodeURIComponent(filename)}`,
+      buffer,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'xero-tenant-id': tenantId,
+          'Content-Type': mimeType || 'application/pdf',
+          'Content-Length': buffer.length,
+        },
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+      }
+    );
+    res.json({ success: true, bytesAttached: buffer.length, attachment: r.data.Attachments?.[0] });
+  } catch (err) {
+    console.error('Status:', err.response?.status);
+    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
+    console.error('Message:', err.message);
+    res.status(500).json({ error: err.response?.data?.Message || err.response?.data?.error?.message || err.message });
+  }
+});
+
+app.post('/api/xero-attach-gmail-pdf-to-spend-money', async (req, res) => {
+  console.log('═══ ATTACH GMAIL PDF TO SPEND MONEY ═══');
+  console.log(JSON.stringify(req.body, null, 2));
+  const { bankTransactionId, gmailMessageId, gmailAttachmentId, filename, mimeType } = req.body;
+  if (!bankTransactionId || !gmailMessageId || !gmailAttachmentId || !filename) {
+    return res.status(400).json({ error: 'bankTransactionId, gmailMessageId, gmailAttachmentId, filename are required' });
+  }
+  try {
+    const buffer = await fetchGmailAttachment(gmailMessageId, gmailAttachmentId);
+    const { token, tenantId } = await getValidToken();
+    const r = await axios.post(
+      `https://api.xero.com/api.xro/2.0/BankTransactions/${bankTransactionId}/Attachments/${encodeURIComponent(filename)}`,
+      buffer,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'xero-tenant-id': tenantId,
+          'Content-Type': mimeType || 'application/pdf',
+          'Content-Length': buffer.length,
+        },
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+      }
+    );
+    res.json({ success: true, bytesAttached: buffer.length, attachment: r.data.Attachments?.[0] });
+  } catch (err) {
+    console.error('Status:', err.response?.status);
+    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
+    console.error('Message:', err.message);
+    res.status(500).json({ error: err.response?.data?.Message || err.response?.data?.error?.message || err.message });
+  }
+});
+
+// Stel (and any other email-only supplier) has no PDF — the email body IS
+// the invoice. Attach the raw message as .eml instead.
+app.post('/api/xero-attach-gmail-email-to-bill', async (req, res) => {
+  console.log('═══ ATTACH GMAIL EMAIL TO BILL ═══');
+  console.log(JSON.stringify(req.body, null, 2));
+  const { billId, gmailMessageId, filename } = req.body;
+  if (!billId || !gmailMessageId) {
+    return res.status(400).json({ error: 'billId and gmailMessageId are required' });
+  }
+  try {
+    const buffer = await fetchGmailRawMessage(gmailMessageId);
+    const { token, tenantId } = await getValidToken();
+    const name = filename || `email-${gmailMessageId}.eml`;
+    const r = await axios.post(
+      `https://api.xero.com/api.xro/2.0/Invoices/${billId}/Attachments/${encodeURIComponent(name)}`,
+      buffer,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'xero-tenant-id': tenantId,
+          'Content-Type': 'message/rfc822',
+          'Content-Length': buffer.length,
+        },
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+      }
+    );
+    res.json({ success: true, bytesAttached: buffer.length, attachment: r.data.Attachments?.[0] });
+  } catch (err) {
+    console.error('Status:', err.response?.status);
+    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
+    console.error('Message:', err.message);
+    res.status(500).json({ error: err.response?.data?.Message || err.response?.data?.error?.message || err.message });
+  }
+});
+
+app.post('/api/xero-attach-gmail-email-to-spend-money', async (req, res) => {
+  console.log('═══ ATTACH GMAIL EMAIL TO SPEND MONEY ═══');
+  console.log(JSON.stringify(req.body, null, 2));
+  const { bankTransactionId, gmailMessageId, filename } = req.body;
+  if (!bankTransactionId || !gmailMessageId) {
+    return res.status(400).json({ error: 'bankTransactionId and gmailMessageId are required' });
+  }
+  try {
+    const buffer = await fetchGmailRawMessage(gmailMessageId);
+    const { token, tenantId } = await getValidToken();
+    const name = filename || `email-${gmailMessageId}.eml`;
+    const r = await axios.post(
+      `https://api.xero.com/api.xro/2.0/BankTransactions/${bankTransactionId}/Attachments/${encodeURIComponent(name)}`,
+      buffer,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'xero-tenant-id': tenantId,
+          'Content-Type': 'message/rfc822',
+          'Content-Length': buffer.length,
+        },
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+      }
+    );
+    res.json({ success: true, bytesAttached: buffer.length, attachment: r.data.Attachments?.[0] });
+  } catch (err) {
+    console.error('Status:', err.response?.status);
+    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
+    console.error('Message:', err.message);
+    res.status(500).json({ error: err.response?.data?.Message || err.response?.data?.error?.message || err.message });
+  }
+});
 const MCP_TOOLS = [
   { name: 'check_duplicate_invoice', description: 'Check if an invoice number already exists in Xero — searches BOTH purchase bills (ACCPAY) AND Spend Money bank transactions (by Reference field). ALWAYS call this before creating a bill. Returns { existsAsBill, existsAsSpendMoney, bill, spendMoney, ... }. Stel Coffee sends overdue reminder emails so this check is critical. Note: Spend Money match depends on the invoice number being stored in the Reference field — for legacy entries that may not have a reference, use search_spend_money with contactName + amount as a cross-check.', inputSchema: { type: 'object', properties: { invoice_number: { type: 'string' } }, required: ['invoice_number'] } },
   { name: 'create_xero_bill', description: 'Create a purchase bill in Xero as a DRAFT. Only call after confirming no duplicate with check_duplicate_invoice.', inputSchema: { type: 'object', properties: { supplier_name: { type: 'string' }, invoice_number: { type: 'string' }, invoice_date: { type: 'string', description: 'YYYY-MM-DD' }, due_date: { type: 'string', description: 'YYYY-MM-DD, default net 30' }, line_items: { type: 'array', items: { type: 'object', properties: { description: { type: 'string' }, quantity: { type: 'number', default: 1 }, unit_amount: { type: 'number', description: 'EX-GST amount' }, account_code: { type: 'string', description: 'Coffee/milk=700, Food&Bev=701, General=429' }, tax_type: { type: 'string', default: 'INPUT' } }, required: ['description', 'unit_amount', 'account_code'] } } }, required: ['supplier_name', 'invoice_number', 'invoice_date', 'line_items'] } },
@@ -666,6 +1001,74 @@ const MCP_TOOLS = [
       required: ['bank_transaction_id', 'filename', 'base64_content'],
     },
   },
+  {
+    name: 'list_supplier_invoice_emails',
+    description: 'List Gmail messages under a specified label, with attachment metadata. Designed for the Monday weekly workflow: fetch everything in the "Supplier invoices" label to find unprocessed Moco, Big Michael\'s, and Coca-Cola invoices. Returns messageId + attachmentId for each attachment — use those IDs with attach_gmail_pdf_to_bill / attach_gmail_pdf_to_spend_money. The tool does NOT mark messages as processed; use check_duplicate_invoice on each invoice number to see if it\'s already in Xero.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        label: { type: 'string', description: 'Gmail label display name, e.g. "Supplier invoices".' },
+        max_results: { type: 'number', description: 'Max messages to return (default 50).' },
+      },
+      required: ['label'],
+    },
+  },
+  {
+    name: 'attach_gmail_pdf_to_bill',
+    description: 'Attach a PDF from a Gmail message directly to a Xero bill. Railway fetches the attachment server-side — no base64 over MCP — so this works for large PDFs. Use after creating a bill for a supplier whose invoice arrived via Gmail as a PDF attachment.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        bill_id: { type: 'string', description: 'Xero InvoiceID (UUID) of the bill.' },
+        gmail_message_id: { type: 'string', description: 'Gmail message ID containing the attachment.' },
+        gmail_attachment_id: { type: 'string', description: 'Gmail attachmentId — get this from list_supplier_invoice_emails.' },
+        filename: { type: 'string', description: 'Filename to use in Xero (e.g. "invoice-4217654.pdf").' },
+        mime_type: { type: 'string', default: 'application/pdf' },
+      },
+      required: ['bill_id', 'gmail_message_id', 'gmail_attachment_id', 'filename'],
+    },
+  },
+  {
+    name: 'attach_gmail_pdf_to_spend_money',
+    description: 'Attach a PDF from a Gmail message directly to a Xero Spend Money transaction. Railway fetches the attachment server-side. Standard path for Moco, Big Michael\'s, Coca-Cola invoices.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        bank_transaction_id: { type: 'string', description: 'Xero BankTransactionID (UUID) of the Spend Money txn.' },
+        gmail_message_id: { type: 'string' },
+        gmail_attachment_id: { type: 'string' },
+        filename: { type: 'string' },
+        mime_type: { type: 'string', default: 'application/pdf' },
+      },
+      required: ['bank_transaction_id', 'gmail_message_id', 'gmail_attachment_id', 'filename'],
+    },
+  },
+  {
+    name: 'attach_gmail_email_to_bill',
+    description: 'Attach the raw Gmail message (as .eml) to a Xero bill. Use when the invoice has no PDF attachment and the email body IS the invoice — e.g. Stel Coffee emails from MYOB PayDirect, which have line items in the body but no PDF.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        bill_id: { type: 'string' },
+        gmail_message_id: { type: 'string' },
+        filename: { type: 'string', description: 'Optional. Defaults to "email-<messageId>.eml".' },
+      },
+      required: ['bill_id', 'gmail_message_id'],
+    },
+  },
+  {
+    name: 'attach_gmail_email_to_spend_money',
+    description: 'Attach the raw Gmail message (as .eml) to a Xero Spend Money transaction. Use for email-only invoices paid on card.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        bank_transaction_id: { type: 'string' },
+        gmail_message_id: { type: 'string' },
+        filename: { type: 'string' },
+      },
+      required: ['bank_transaction_id', 'gmail_message_id'],
+    },
+  },
 ];
 
 async function executeTool(name, params) {
@@ -714,6 +1117,40 @@ async function executeTool(name, params) {
         filename: params.filename,
         base64Content: params.base64_content,
         mimeType: params.mime_type || 'application/pdf',
+      })).data;
+    case 'list_supplier_invoice_emails': {
+      const qs = new URLSearchParams();
+      qs.set('label', params.label);
+      if (params.max_results) qs.set('maxResults', String(params.max_results));
+      return (await axios.get(`${BASE}/api/gmail-list-by-label?${qs}`)).data;
+    }
+    case 'attach_gmail_pdf_to_bill':
+      return (await axios.post(`${BASE}/api/xero-attach-gmail-pdf-to-bill`, {
+        billId: params.bill_id,
+        gmailMessageId: params.gmail_message_id,
+        gmailAttachmentId: params.gmail_attachment_id,
+        filename: params.filename,
+        mimeType: params.mime_type || 'application/pdf',
+      })).data;
+    case 'attach_gmail_pdf_to_spend_money':
+      return (await axios.post(`${BASE}/api/xero-attach-gmail-pdf-to-spend-money`, {
+        bankTransactionId: params.bank_transaction_id,
+        gmailMessageId: params.gmail_message_id,
+        gmailAttachmentId: params.gmail_attachment_id,
+        filename: params.filename,
+        mimeType: params.mime_type || 'application/pdf',
+      })).data;
+    case 'attach_gmail_email_to_bill':
+      return (await axios.post(`${BASE}/api/xero-attach-gmail-email-to-bill`, {
+        billId: params.bill_id,
+        gmailMessageId: params.gmail_message_id,
+        filename: params.filename,
+      })).data;
+    case 'attach_gmail_email_to_spend_money':
+      return (await axios.post(`${BASE}/api/xero-attach-gmail-email-to-spend-money`, {
+        bankTransactionId: params.bank_transaction_id,
+        gmailMessageId: params.gmail_message_id,
+        filename: params.filename,
       })).data;
     default: throw new Error(`Unknown tool: ${name}`);
   }
@@ -782,6 +1219,12 @@ app.get('/api/debug', (req, res) => {
     hasSecret: !!process.env.XERO_CLIENT_SECRET,
     hasStoredRefreshToken: !!xeroStore.refreshToken,
     tenantId: xeroStore.tenantId,
+    gmail: {
+      clientIdConfigured: !!process.env.GMAIL_CLIENT_ID,
+      clientSecretConfigured: !!process.env.GMAIL_CLIENT_SECRET,
+      redirectUri: process.env.GMAIL_REDIRECT_URI || null,
+      hasStoredRefreshToken: !!gmailStore.refreshToken,
+    },
   });
 });
 
