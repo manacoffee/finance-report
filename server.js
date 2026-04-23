@@ -1228,6 +1228,30 @@ app.get('/api/debug', (req, res) => {
   });
 });
 
+// One-shot endpoints to reveal refresh tokens so they can be copied into
+// Railway env vars (GMAIL_REFRESH_TOKEN / XERO_REFRESH_TOKEN) to survive
+// redeploys. These endpoints expose secrets — DO NOT hit them from untrusted
+// networks. Use once after OAuth, copy to env var, then forget.
+app.get('/api/reveal-gmail-refresh-token', (req, res) => {
+  if (!gmailStore.refreshToken) {
+    return res.status(404).json({ error: 'No Gmail refresh token stored. Visit /api/gmail-auth first.' });
+  }
+  res.json({
+    refreshToken: gmailStore.refreshToken,
+    instructions: 'Copy this value into the Railway env var GMAIL_REFRESH_TOKEN, then redeploy. Do NOT share this token.',
+  });
+});
+
+app.get('/api/reveal-xero-refresh-token', (req, res) => {
+  if (!xeroStore.refreshToken) {
+    return res.status(404).json({ error: 'No Xero refresh token stored. Visit /api/xero-auth first.' });
+  }
+  res.json({
+    refreshToken: xeroStore.refreshToken,
+    instructions: 'Copy this value into the Railway env var XERO_REFRESH_TOKEN, then redeploy. Do NOT share this token.',
+  });
+});
+
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 const PORT = process.env.PORT || 3000;
