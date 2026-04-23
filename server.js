@@ -528,9 +528,85 @@ app.post('/api/xero-attach-receipt-spend-money', async (req, res) => {
     res.status(500).json({ error: err.response?.data?.Message || err.message });
   }
 });
+
+app.post('/api/xero-update-bill', async (req, res) => {
+  console.log('═══ UPDATE BILL REQUEST ═══');
+  console.log(JSON.stringify(req.body, null, 2));
+  console.log('═══════════════════════════');
+  const { invoiceId, supplierName, invoiceDate, dueDate, reference, status } = req.body;
+  if (!invoiceId) return res.status(400).json({ error: 'invoiceId required' });
+  if (!supplierName && !invoiceDate && !dueDate && reference === undefined && !status) {
+    return res.status(400).json({ error: 'At least one field to update required: supplierName, invoiceDate, dueDate, reference, or status' });
+  }
+  try {
+    const { token, tenantId } = await getValidToken();
+
+    // Build partial-update payload — only include fields that were provided
+    const updated = { InvoiceID: invoiceId };
+
+    if (supplierName) {
+      const contactRes = await axios.get(
+        `https://api.xero.com/api.xro/2.0/Contacts?searchTerm=${encodeURIComponent(supplierName)}`,
+        { headers: xeroHeaders(token, tenantId) }
+      );
+      const contact = contactRes.data.Contacts?.[0];
+      if (!contact) return res.status(404).json({ error: `Supplier "${supplierName}" not found in Xero contacts.` });
+      updated.Contact = { ContactID: contact.ContactID };
+    }
+    if (invoiceDate) updated.Date = invoiceDate;
+    if (dueDate) updated.DueDate = dueDate;
+    if (reference !== undefined) updated.Reference = reference;
+    if (status) updated.Status = status;
+
+    const r = await axios.post(
+      `https://api.xero.com/api.xro/2.0/Invoices/${invoiceId}`,
+      { Invoices: [updated] },
+      { headers: xeroHeaders(token, tenantId) }
+    );
+    const result = r.data.Invoices?.[0];
+    res.json({
+      success: true,
+      invoiceId: result?.InvoiceID,
+      invoiceNumber: result?.InvoiceNumber,
+      status: result?.Status,
+      total: result?.Total,
+      contact: result?.Contact?.Name,
+      date: result?.Date,
+      dueDate: result?.DueDate,
+      reference: result?.Reference,
+    });
+  } catch (err) {
+    console.error('═══ UPDATE BILL ERROR ═══');
+    console.error('Status:', err.response?.status);
+    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
+    console.error('Message:', err.message);
+    console.error('═════════════════════════');
+    res.status(500).json({
+      error: err.response?.data?.Message || err.message,
+      xeroResponse: err.response?.data,
+      xeroStatus: err.response?.status,
+    });
+  }
+});
 const MCP_TOOLS = [
   { name: 'check_duplicate_invoice', description: 'Check if an invoice number already exists in Xero — searches BOTH purchase bills (ACCPAY) AND Spend Money bank transactions (by Reference field). ALWAYS call this before creating a bill. Returns { existsAsBill, existsAsSpendMoney, bill, spendMoney, ... }. Stel Coffee sends overdue reminder emails so this check is critical. Note: Spend Money match depends on the invoice number being stored in the Reference field — for legacy entries that may not have a reference, use search_spend_money with contactName + amount as a cross-check.', inputSchema: { type: 'object', properties: { invoice_number: { type: 'string' } }, required: ['invoice_number'] } },
   { name: 'create_xero_bill', description: 'Create a purchase bill in Xero as a DRAFT. Only call after confirming no duplicate with check_duplicate_invoice.', inputSchema: { type: 'object', properties: { supplier_name: { type: 'string' }, invoice_number: { type: 'string' }, invoice_date: { type: 'string', description: 'YYYY-MM-DD' }, due_date: { type: 'string', description: 'YYYY-MM-DD, default net 30' }, line_items: { type: 'array', items: { type: 'object', properties: { description: { type: 'string' }, quantity: { type: 'number', default: 1 }, unit_amount: { type: 'number', description: 'EX-GST amount' }, account_code: { type: 'string', description: 'Coffee/milk=700, Food&Bev=701, General=429' }, tax_type: { type: 'string', default: 'INPUT' } }, required: ['description', 'unit_amount', 'account_code'] } } }, required: ['supplier_name', 'invoice_number', 'invoice_date', 'line_items'] } },
+  {
+    name: 'update_xero_bill',
+    description: 'Update an existing purchase bill (ACCPAY) in Xero. Use when a bill needs its contact, dates, reference, or status changed after creation — e.g. when a supplier contact has been renamed, a due date was wrong, or to move a DRAFT to AUTHORISED. Does NOT update line items (delete and recreate instead for line item changes). Only fields provided are modified; other fields remain untouched. At least one updatable field must be provided.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        invoice_id: { type: 'string', description: 'The Xero InvoiceID (UUID) of the bill to update. Obtainable from create_xero_bill responses or check_duplicate_invoice.' },
+        supplier_name: { type: 'string', description: 'Optional — change the contact on the bill. Supplier must already exist in Xero contacts (search is by first match).' },
+        invoice_date: { type: 'string', description: 'Optional — new invoice Date in YYYY-MM-DD format.' },
+        due_date: { type: 'string', description: 'Optional — new DueDate in YYYY-MM-DD format.' },
+        reference: { type: 'string', description: 'Optional — set or change the Reference field. Pass empty string "" to clear.' },
+        status: { type: 'string', description: 'Optional — change status. Valid transitions: DRAFT → SUBMITTED → AUTHORISED, or DELETED to void a draft.' },
+      },
+      required: ['invoice_id'],
+    },
+  },
   { name: 'attach_receipt_to_bill', description: 'Attach a PDF receipt to an existing Xero bill', inputSchema: { type: 'object', properties: { bill_id: { type: 'string' }, filename: { type: 'string' }, base64_content: { type: 'string' }, mime_type: { type: 'string', default: 'application/pdf' } }, required: ['bill_id', 'filename', 'base64_content'] } },
   { name: 'get_open_bills', description: 'Get draft and authorised bills from Xero for reconciliation matching.', inputSchema: { type: 'object', properties: { from_date: { type: 'string' }, to_date: { type: 'string' } } } },
   {
@@ -597,6 +673,15 @@ async function executeTool(name, params) {
   switch (name) {
     case 'check_duplicate_invoice': return (await axios.get(`${BASE}/api/xero-check-invoice?invoiceNumber=${encodeURIComponent(params.invoice_number)}`)).data;
     case 'create_xero_bill': return (await axios.post(`${BASE}/api/xero-create-bill`, { supplierName: params.supplier_name, invoiceNumber: params.invoice_number, invoiceDate: params.invoice_date, dueDate: params.due_date, lineItems: (params.line_items || []).map(li => ({ description: li.description, quantity: li.quantity || 1, unitAmount: li.unit_amount, accountCode: li.account_code, taxType: li.tax_type || 'INPUT' })) })).data;
+    case 'update_xero_bill':
+      return (await axios.post(`${BASE}/api/xero-update-bill`, {
+        invoiceId: params.invoice_id,
+        supplierName: params.supplier_name,
+        invoiceDate: params.invoice_date,
+        dueDate: params.due_date,
+        reference: params.reference,
+        status: params.status,
+      })).data;
     case 'attach_receipt_to_bill': return (await axios.post(`${BASE}/api/xero-attach-receipt`, { billId: params.bill_id, filename: params.filename, base64Content: params.base64_content, mimeType: params.mime_type || 'application/pdf' })).data;
     case 'get_open_bills': { const qs = new URLSearchParams(); if (params.from_date) qs.set('fromDate', params.from_date); if (params.to_date) qs.set('toDate', params.to_date); return (await axios.get(`${BASE}/api/xero-open-bills?${qs}`)).data; }
     case 'search_spend_money': {
