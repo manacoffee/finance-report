@@ -244,15 +244,117 @@ app.get('/api/xero-check-invoice', async (req, res) => {
   if (!invoiceNumber) return res.status(400).json({ error: 'invoiceNumber required' });
   try {
     const { token, tenantId } = await getValidToken();
-    const r = await axios.get(
+
+    // 1. Check purchase bills (ACCPAY invoices)
+    const billsRes = await axios.get(
       `https://api.xero.com/api.xro/2.0/Invoices?InvoiceNumbers=${encodeURIComponent(invoiceNumber)}&Type=ACCPAY`,
       { headers: xeroHeaders(token, tenantId) }
     );
-    const invoices = r.data.Invoices || [];
-    const active = invoices.filter(i => i.Status !== 'VOIDED');
-    res.json({ exists: active.length > 0, status: active[0]?.Status || null, invoiceId: active[0]?.InvoiceID || null });
+    const invoices = billsRes.data.Invoices || [];
+    const activeBills = invoices.filter(i => i.Status !== 'VOIDED');
+    const bill = activeBills[0] || null;
+
+    // 2. Check Spend Money bank transactions by Reference field
+    const spendWhere = `Type=="SPEND" AND Reference!=null AND Reference.Contains("${String(invoiceNumber).replace(/"/g, '\\"')}")`;
+    const spendRes = await axios.get(
+      `https://api.xero.com/api.xro/2.0/BankTransactions?where=${encodeURIComponent(spendWhere)}`,
+      { headers: xeroHeaders(token, tenantId) }
+    );
+    const spendTxs = (spendRes.data.BankTransactions || []).filter(t => t.Status !== 'DELETED' && t.Status !== 'VOIDED');
+    const spend = spendTxs[0] || null;
+
+    const existsAsBill = !!bill;
+    const existsAsSpendMoney = !!spend;
+
+    res.json({
+      // Legacy shape — kept for backwards compatibility
+      exists: existsAsBill || existsAsSpendMoney,
+      status: bill?.Status || spend?.Status || null,
+      invoiceId: bill?.InvoiceID || null,
+      // Expanded shape
+      existsAsBill,
+      bill: bill ? { invoiceId: bill.InvoiceID, status: bill.Status, total: bill.Total, date: bill.Date, contact: bill.Contact?.Name } : null,
+      existsAsSpendMoney,
+      spendMoney: spend ? { bankTransactionId: spend.BankTransactionID, status: spend.Status, total: spend.Total, date: spend.Date, reference: spend.Reference, contact: spend.Contact?.Name } : null,
+      spendMoneyMatches: spendTxs.length,
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('═══ CHECK INVOICE ERROR ═══');
+    console.error('Status:', err.response?.status);
+    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
+    console.error('Message:', err.message);
+    console.error('═══════════════════════════');
+    res.status(500).json({ error: err.response?.data?.Message || err.message });
+  }
+});
+
+app.get('/api/xero-search-spend-money', async (req, res) => {
+  console.log('═══ SEARCH SPEND MONEY REQUEST ═══');
+  console.log(JSON.stringify(req.query, null, 2));
+  const { reference, contactName, amount, fromDate, toDate, bankAccountCode } = req.query;
+  if (!reference && !contactName && !amount && !fromDate && !toDate) {
+    return res.status(400).json({ error: 'At least one of reference, contactName, amount, fromDate, or toDate is required' });
+  }
+  try {
+    const { token, tenantId } = await getValidToken();
+
+    const clauses = ['Type=="SPEND"'];
+    if (reference) {
+      const safe = String(reference).replace(/"/g, '\\"');
+      clauses.push(`Reference!=null AND Reference.Contains("${safe}")`);
+    }
+    if (contactName) {
+      const safe = String(contactName).replace(/"/g, '\\"');
+      clauses.push(`Contact.Name.Contains("${safe}")`);
+    }
+    if (fromDate) {
+      const [y, m, d] = String(fromDate).split('-').map(Number);
+      if (y && m && d) clauses.push(`Date>=DateTime(${y},${m},${d})`);
+    }
+    if (toDate) {
+      const [y, m, d] = String(toDate).split('-').map(Number);
+      if (y && m && d) clauses.push(`Date<=DateTime(${y},${m},${d})`);
+    }
+    const where = clauses.join(' AND ');
+    const r = await axios.get(
+      `https://api.xero.com/api.xro/2.0/BankTransactions?where=${encodeURIComponent(where)}`,
+      { headers: xeroHeaders(token, tenantId) }
+    );
+    let txs = (r.data.BankTransactions || []).filter(t => t.Status !== 'DELETED' && t.Status !== 'VOIDED');
+
+    // Amount filter applied in-memory because Xero's where clause for BankTransaction Total is flaky
+    if (amount) {
+      const target = Number(amount);
+      if (!Number.isNaN(target)) {
+        txs = txs.filter(t => Math.abs(Number(t.Total) - target) < 0.02);
+      }
+    }
+
+    // Optional bank account filter (in-memory)
+    if (bankAccountCode) {
+      txs = txs.filter(t => t.BankAccount?.Code === String(bankAccountCode));
+    }
+
+    res.json({
+      count: txs.length,
+      transactions: txs.map(t => ({
+        bankTransactionId: t.BankTransactionID,
+        date: t.Date,
+        status: t.Status,
+        total: t.Total,
+        reference: t.Reference,
+        contact: t.Contact?.Name,
+        bankAccountCode: t.BankAccount?.Code,
+        bankAccountName: t.BankAccount?.Name,
+      })),
+    });
+  } catch (err) {
+    console.error('═══ SEARCH SPEND MONEY ERROR ═══');
+    console.error('Status:', err.response?.status);
+    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
+    console.error('Message:', err.message);
+    console.error('════════════════════════════════');
+    res.status(500).json({ error: err.response?.data?.Message || err.message });
   }
 });
 
@@ -427,10 +529,25 @@ app.post('/api/xero-attach-receipt-spend-money', async (req, res) => {
   }
 });
 const MCP_TOOLS = [
-  { name: 'check_duplicate_invoice', description: 'Check if an invoice number already exists in Xero. ALWAYS call this before creating a bill. Stel Coffee sends overdue reminder emails so this check is critical.', inputSchema: { type: 'object', properties: { invoice_number: { type: 'string' } }, required: ['invoice_number'] } },
+  { name: 'check_duplicate_invoice', description: 'Check if an invoice number already exists in Xero — searches BOTH purchase bills (ACCPAY) AND Spend Money bank transactions (by Reference field). ALWAYS call this before creating a bill. Returns { existsAsBill, existsAsSpendMoney, bill, spendMoney, ... }. Stel Coffee sends overdue reminder emails so this check is critical. Note: Spend Money match depends on the invoice number being stored in the Reference field — for legacy entries that may not have a reference, use search_spend_money with contactName + amount as a cross-check.', inputSchema: { type: 'object', properties: { invoice_number: { type: 'string' } }, required: ['invoice_number'] } },
   { name: 'create_xero_bill', description: 'Create a purchase bill in Xero as a DRAFT. Only call after confirming no duplicate with check_duplicate_invoice.', inputSchema: { type: 'object', properties: { supplier_name: { type: 'string' }, invoice_number: { type: 'string' }, invoice_date: { type: 'string', description: 'YYYY-MM-DD' }, due_date: { type: 'string', description: 'YYYY-MM-DD, default net 30' }, line_items: { type: 'array', items: { type: 'object', properties: { description: { type: 'string' }, quantity: { type: 'number', default: 1 }, unit_amount: { type: 'number', description: 'EX-GST amount' }, account_code: { type: 'string', description: 'Coffee/milk=700, Food&Bev=701, General=429' }, tax_type: { type: 'string', default: 'INPUT' } }, required: ['description', 'unit_amount', 'account_code'] } } }, required: ['supplier_name', 'invoice_number', 'invoice_date', 'line_items'] } },
   { name: 'attach_receipt_to_bill', description: 'Attach a PDF receipt to an existing Xero bill', inputSchema: { type: 'object', properties: { bill_id: { type: 'string' }, filename: { type: 'string' }, base64_content: { type: 'string' }, mime_type: { type: 'string', default: 'application/pdf' } }, required: ['bill_id', 'filename', 'base64_content'] } },
   { name: 'get_open_bills', description: 'Get draft and authorised bills from Xero for reconciliation matching.', inputSchema: { type: 'object', properties: { from_date: { type: 'string' }, to_date: { type: 'string' } } } },
+  {
+    name: 'search_spend_money',
+    description: 'Search existing Spend Money (SPEND) bank transactions in Xero by any combination of reference, contact name, amount, and date range. Use this to catch duplicates for invoices that were previously entered as Spend Money rather than bills — especially legacy entries where the invoice number may not be in the Reference field (in which case, match on contact_name + amount + date range). At least one filter is required.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        reference: { type: 'string', description: 'Substring to match against the Reference field (case-sensitive). E.g. invoice number.' },
+        contact_name: { type: 'string', description: 'Substring to match against the Contact name. E.g. "Stel Coffee", "Norkatu".' },
+        amount: { type: 'number', description: 'Exact transaction total (inc GST) to match, ±$0.01.' },
+        from_date: { type: 'string', description: 'YYYY-MM-DD, inclusive' },
+        to_date: { type: 'string', description: 'YYYY-MM-DD, inclusive' },
+        bank_account_code: { type: 'string', description: 'Optional — filter by bank account code e.g. 605.' },
+      },
+    },
+  },
   {
     name: 'create_spend_money',
     description: 'Create an AUTHORISED Spend Money transaction in Xero for purchases already paid by card/bank. Use for receipt photos (Bunnings, Woolworths, fuel etc). Defaults to bank account code 605 (Business Trans Acct).',
@@ -482,6 +599,16 @@ async function executeTool(name, params) {
     case 'create_xero_bill': return (await axios.post(`${BASE}/api/xero-create-bill`, { supplierName: params.supplier_name, invoiceNumber: params.invoice_number, invoiceDate: params.invoice_date, dueDate: params.due_date, lineItems: (params.line_items || []).map(li => ({ description: li.description, quantity: li.quantity || 1, unitAmount: li.unit_amount, accountCode: li.account_code, taxType: li.tax_type || 'INPUT' })) })).data;
     case 'attach_receipt_to_bill': return (await axios.post(`${BASE}/api/xero-attach-receipt`, { billId: params.bill_id, filename: params.filename, base64Content: params.base64_content, mimeType: params.mime_type || 'application/pdf' })).data;
     case 'get_open_bills': { const qs = new URLSearchParams(); if (params.from_date) qs.set('fromDate', params.from_date); if (params.to_date) qs.set('toDate', params.to_date); return (await axios.get(`${BASE}/api/xero-open-bills?${qs}`)).data; }
+    case 'search_spend_money': {
+      const qs = new URLSearchParams();
+      if (params.reference) qs.set('reference', params.reference);
+      if (params.contact_name) qs.set('contactName', params.contact_name);
+      if (params.amount !== undefined && params.amount !== null) qs.set('amount', String(params.amount));
+      if (params.from_date) qs.set('fromDate', params.from_date);
+      if (params.to_date) qs.set('toDate', params.to_date);
+      if (params.bank_account_code) qs.set('bankAccountCode', params.bank_account_code);
+      return (await axios.get(`${BASE}/api/xero-search-spend-money?${qs}`)).data;
+    }
     case 'create_spend_money':
       return (await axios.post(`${BASE}/api/xero-create-spend-money`, {
         payeeName: params.payee_name,
