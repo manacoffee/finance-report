@@ -320,6 +320,16 @@ app.post('/api/extract-pdf-text', async (req, res) => {
   }
 });
 
+app.post('/api/extract-email-body', async (req, res) => {
+  try {
+    const result = await extractEmailBodyFromGmail(req.body);
+    res.json(result);
+  } catch (err) {
+    console.error('extract-email-body error:', err.response?.data || err.message);
+    res.status(500).json({ error: err.response?.data?.error?.message || err.message });
+  }
+});
+
 app.post('/api/generate-report', async (req, res) => {
   const { weekLabel, coffeeEx, foodEx, total, cogsCoEx, cogsFdEx, totalCOGS, gp, gpPct, labourEx, labourPct, txns, avg } = req.body;
   const fmt = n => `$${Number(n).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -823,6 +833,106 @@ async function extractPdfTextFromGmail({ messageId, attachmentId, maxChars = 500
   };
 }
 
+// Fetch a full Gmail message (headers + payload tree). Used by
+// extractEmailBodyFromGmail to walk MIME parts. Uses format=full rather than
+// format=raw so the API pre-parses the MIME structure for us.
+async function fetchGmailFullMessage(messageId) {
+  const token = await getValidGmailToken();
+  const r = await axios.get(
+    `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?format=full`,
+    { headers: gmailHeaders(token) }
+  );
+  if (!r.data.payload) throw new Error('Gmail full message returned empty payload');
+  return r.data;
+}
+
+// Minimal HTML-to-text conversion for email bodies. Sufficient for parsing
+// supplier invoice emails (CCA, etc.) where we just need the readable text.
+// Not a general-purpose HTML parser — don't feed it arbitrary web pages.
+function stripHtml(html) {
+  return html
+    // Remove script/style blocks entirely
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    // Inject newlines for block-level elements so text doesn't mash together
+    .replace(/<\/(p|div|li|h[1-6]|tr|table)>/gi, '\n')
+    .replace(/<br\s*\/?>/gi, '\n')
+    // Strip remaining tags
+    .replace(/<[^>]+>/g, '')
+    // Decode common named HTML entities
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&apos;/gi, "'")
+    .replace(/&hellip;/gi, '…')
+    // Decode numeric HTML entities (decimal and hex)
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    // Collapse whitespace without destroying intentional line breaks
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n[ \t]+/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+// Fetch a Gmail message server-side and return its body text. Prefers
+// text/plain MIME parts; falls back to stripping HTML from text/html if plain
+// text is absent. Used for supplier invoices where data lives in the email
+// body rather than a PDF attachment (e.g. Coca-Cola CCEP Non-Stock Invoice).
+// Decodes all parts as UTF-8 — if a supplier sends in a different charset,
+// mojibake is the failure mode and we'd need charset-aware decoding.
+async function extractEmailBodyFromGmail({ messageId, maxChars = 50000 }) {
+  if (!messageId) throw new Error('messageId is required');
+
+  const message = await fetchGmailFullMessage(messageId);
+
+  // Walk the MIME tree, collecting text/plain and text/html leaf parts.
+  const collected = { plain: [], html: [] };
+  function walk(part) {
+    if (!part) return;
+    if (part.mimeType === 'text/plain' && part.body?.data) {
+      collected.plain.push(base64urlDecode(part.body.data).toString('utf8'));
+    } else if (part.mimeType === 'text/html' && part.body?.data) {
+      collected.html.push(base64urlDecode(part.body.data).toString('utf8'));
+    }
+    if (Array.isArray(part.parts)) {
+      for (const child of part.parts) walk(child);
+    }
+  }
+  walk(message.payload);
+
+  let bodySource = 'plain';
+  let body = collected.plain.join('\n\n').trim();
+  if (!body && collected.html.length > 0) {
+    bodySource = 'html';
+    body = stripHtml(collected.html.join('\n\n')).trim();
+  }
+  if (!body) bodySource = null; // no text body found
+
+  // Surface useful headers so the caller doesn't need a separate metadata call.
+  const headers = message.payload?.headers || [];
+  const getHeader = name =>
+    headers.find(h => h.name?.toLowerCase() === name.toLowerCase())?.value || null;
+
+  const effectiveMax = Number(maxChars) > 0 ? Number(maxChars) : 50000;
+  const text = body.length > effectiveMax
+    ? body.slice(0, effectiveMax) + '\n[...truncated]'
+    : body;
+
+  return {
+    messageId,
+    subject: getHeader('Subject'),
+    from: getHeader('From'),
+    date: getHeader('Date'),
+    bodySource, // 'plain' | 'html' | null
+    charsReturned: text.length,
+    text,
+  };
+}
+
 app.post('/api/xero-attach-gmail-pdf-to-bill', async (req, res) => {
   console.log('═══ ATTACH GMAIL PDF TO BILL ═══');
   console.log(JSON.stringify(req.body, null, 2));
@@ -1118,6 +1228,18 @@ const MCP_TOOLS = [
       required: ['message_id', 'attachment_id'],
     },
   },
+  {
+    name: 'extract_gmail_email_body',
+    description: 'Fetch a Gmail message server-side and return its body text. Prefers text/plain MIME part; falls back to stripping HTML from text/html if plain text is absent. Use for supplier invoices where invoice data lives in the email body rather than a PDF attachment (e.g. Coca-Cola CCEP Non-Stock Invoice emails from aus.coke.credit@ccamatil.com). Get message_id from list_supplier_invoice_emails. No new OAuth scopes needed — uses the same gmail.readonly scope as extract_gmail_pdf_text.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message_id: { type: 'string', description: 'Gmail message ID.' },
+        max_chars: { type: 'number', description: 'Max characters of body text to return. Defaults to 50000.' },
+      },
+      required: ['message_id'],
+    },
+  },
 ];
 
 async function executeTool(name, params) {
@@ -1205,6 +1327,11 @@ async function executeTool(name, params) {
       return await extractPdfTextFromGmail({
         messageId: params.message_id,
         attachmentId: params.attachment_id,
+        maxChars: params.max_chars,
+      });
+    case 'extract_gmail_email_body':
+      return await extractEmailBodyFromGmail({
+        messageId: params.message_id,
         maxChars: params.max_chars,
       });
     default: throw new Error(`Unknown tool: ${name}`);
