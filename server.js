@@ -2,6 +2,7 @@ const express = require('express');
 const axios = require('axios');
 const path = require('path');
 const { randomUUID } = require('crypto');
+const pdf = require('pdf-parse');
 
 const app = express();
 app.use((req, res, next) => {
@@ -306,6 +307,15 @@ app.post('/api/parse-invoice', async (req, res) => {
   } catch (err) {
     console.error('Invoice parse error:', err.message);
     res.status(500).json({ error: 'Failed to parse invoice' });
+  }
+});
+app.post('/api/extract-pdf-text', async (req, res) => {
+  try {
+    const result = await extractPdfTextFromGmail(req.body);
+    res.json(result);
+  } catch (err) {
+    console.error('extract-pdf-text error:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -1069,6 +1079,28 @@ const MCP_TOOLS = [
       required: ['bank_transaction_id', 'gmail_message_id'],
     },
   },
+{
+  name: 'extract_gmail_pdf_text',
+  description: 'Fetch a Gmail PDF attachment server-side, extract its text via pdf-parse, and return the text. Use for supplier invoices where data lives in the PDF (Moco Net/GST figures, Big Michaels line items, CCA totals). Get messageId + attachmentId from list_supplier_invoice_emails. Safe for large PDFs — bytes never leave Railway.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      messageId: {
+        type: 'string',
+        description: 'Gmail message ID containing the PDF attachment.',
+      },
+      attachmentId: {
+        type: 'string',
+        description: 'Gmail attachmentId (from list_supplier_invoice_emails).',
+      },
+      maxChars: {
+        type: 'number',
+        description: 'Max characters of extracted text to return. Defaults to 50000.',
+      },
+    },
+    required: ['messageId', 'attachmentId'],
+  },
+},
 ];
 
 async function executeTool(name, params) {
@@ -1096,7 +1128,56 @@ async function executeTool(name, params) {
       if (params.to_date) qs.set('toDate', params.to_date);
       if (params.bank_account_code) qs.set('bankAccountCode', params.bank_account_code);
       return (await axios.get(`${BASE}/api/xero-search-spend-money?${qs}`)).data;
-    }
+    }async function extractPdfTextFromGmail({ messageId, attachmentId, maxChars = 50000 }) {
+  if (!messageId || !attachmentId) {
+    throw new Error('messageId and attachmentId are required');
+case 'extract_gmail_pdf_text':
+      return await extractPdfTextFromGmail(args);
+  }
+
+  const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: process.env.GMAIL_CLIENT_ID,
+      client_secret: process.env.GMAIL_CLIENT_SECRET,
+      refresh_token: process.env.GMAIL_REFRESH_TOKEN,
+      grant_type: 'refresh_token',
+    }),
+  });
+  const tokenData = await tokenRes.json();
+  if (!tokenRes.ok) {
+    throw new Error(`Gmail token refresh failed: ${JSON.stringify(tokenData)}`);
+  }
+  const accessToken = tokenData.access_token;
+
+  const attachRes = await fetch(
+    `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}/attachments/${attachmentId}`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  if (!attachRes.ok) {
+    const body = await attachRes.text();
+    throw new Error(`Gmail attachment fetch failed (${attachRes.status}): ${body}`);
+  }
+  const attachData = await attachRes.json();
+
+  const b64 = attachData.data.replace(/-/g, '+').replace(/_/g, '/');
+  const pdfBuffer = Buffer.from(b64, 'base64');
+
+  const parsed = await pdf(pdfBuffer);
+  const text = parsed.text.length > maxChars
+    ? parsed.text.slice(0, maxChars) + '\n[...truncated]'
+    : parsed.text;
+
+  return {
+    messageId,
+    attachmentId,
+    pageCount: parsed.numpages,
+    bytes: pdfBuffer.length,
+    charsReturned: text.length,
+    text,
+  };
+}
     case 'create_spend_money':
       return (await axios.post(`${BASE}/api/xero-create-spend-money`, {
         payeeName: params.payee_name,
