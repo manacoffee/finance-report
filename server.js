@@ -309,13 +309,14 @@ app.post('/api/parse-invoice', async (req, res) => {
     res.status(500).json({ error: 'Failed to parse invoice' });
   }
 });
+
 app.post('/api/extract-pdf-text', async (req, res) => {
   try {
     const result = await extractPdfTextFromGmail(req.body);
     res.json(result);
   } catch (err) {
-    console.error('extract-pdf-text error:', err);
-    res.status(500).json({ error: err.message });
+    console.error('extract-pdf-text error:', err.response?.data || err.message);
+    res.status(500).json({ error: err.response?.data?.error?.message || err.message });
   }
 });
 
@@ -501,6 +502,7 @@ app.post('/api/xero-create-bill', async (req, res) => {
     });
   }
 });
+
 app.post('/api/xero-attach-receipt', async (req, res) => {
   const { billId, filename, base64Content, mimeType } = req.body;
   if (!billId || !filename || !base64Content) return res.status(400).json({ error: 'billId, filename, and base64Content are required' });
@@ -798,6 +800,29 @@ async function fetchGmailRawMessage(messageId) {
   return base64urlDecode(r.data.raw);
 }
 
+// Fetch a Gmail PDF attachment server-side and extract its text via pdf-parse.
+// Used to read Net/GST figures and line items from Moco, Big Michael's, CCA,
+// Stel, Norkatu invoice PDFs without passing bytes through the MCP connection.
+async function extractPdfTextFromGmail({ messageId, attachmentId, maxChars = 50000 }) {
+  if (!messageId || !attachmentId) {
+    throw new Error('messageId and attachmentId are required');
+  }
+  const buffer = await fetchGmailAttachment(messageId, attachmentId);
+  const parsed = await pdf(buffer);
+  const effectiveMax = Number(maxChars) > 0 ? Number(maxChars) : 50000;
+  const text = parsed.text.length > effectiveMax
+    ? parsed.text.slice(0, effectiveMax) + '\n[...truncated]'
+    : parsed.text;
+  return {
+    messageId,
+    attachmentId,
+    pageCount: parsed.numpages,
+    bytes: buffer.length,
+    charsReturned: text.length,
+    text,
+  };
+}
+
 app.post('/api/xero-attach-gmail-pdf-to-bill', async (req, res) => {
   console.log('═══ ATTACH GMAIL PDF TO BILL ═══');
   console.log(JSON.stringify(req.body, null, 2));
@@ -933,6 +958,7 @@ app.post('/api/xero-attach-gmail-email-to-spend-money', async (req, res) => {
     res.status(500).json({ error: err.response?.data?.Message || err.response?.data?.error?.message || err.message });
   }
 });
+
 const MCP_TOOLS = [
   { name: 'check_duplicate_invoice', description: 'Check if an invoice number already exists in Xero — searches BOTH purchase bills (ACCPAY) AND Spend Money bank transactions (by Reference field). ALWAYS call this before creating a bill. Returns { existsAsBill, existsAsSpendMoney, bill, spendMoney, ... }. Stel Coffee sends overdue reminder emails so this check is critical. Note: Spend Money match depends on the invoice number being stored in the Reference field — for legacy entries that may not have a reference, use search_spend_money with contactName + amount as a cross-check.', inputSchema: { type: 'object', properties: { invoice_number: { type: 'string' } }, required: ['invoice_number'] } },
   { name: 'create_xero_bill', description: 'Create a purchase bill in Xero as a DRAFT. Only call after confirming no duplicate with check_duplicate_invoice.', inputSchema: { type: 'object', properties: { supplier_name: { type: 'string' }, invoice_number: { type: 'string' }, invoice_date: { type: 'string', description: 'YYYY-MM-DD' }, due_date: { type: 'string', description: 'YYYY-MM-DD, default net 30' }, line_items: { type: 'array', items: { type: 'object', properties: { description: { type: 'string' }, quantity: { type: 'number', default: 1 }, unit_amount: { type: 'number', description: 'EX-GST amount' }, account_code: { type: 'string', description: 'Coffee/milk=700, Food&Bev=701, General=429' }, tax_type: { type: 'string', default: 'INPUT' } }, required: ['description', 'unit_amount', 'account_code'] } } }, required: ['supplier_name', 'invoice_number', 'invoice_date', 'line_items'] } },
@@ -1079,28 +1105,19 @@ const MCP_TOOLS = [
       required: ['bank_transaction_id', 'gmail_message_id'],
     },
   },
-{
-  name: 'extract_gmail_pdf_text',
-  description: 'Fetch a Gmail PDF attachment server-side, extract its text via pdf-parse, and return the text. Use for supplier invoices where data lives in the PDF (Moco Net/GST figures, Big Michaels line items, CCA totals). Get messageId + attachmentId from list_supplier_invoice_emails. Safe for large PDFs — bytes never leave Railway.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      messageId: {
-        type: 'string',
-        description: 'Gmail message ID containing the PDF attachment.',
+  {
+    name: 'extract_gmail_pdf_text',
+    description: 'Fetch a Gmail PDF attachment server-side, extract its text via pdf-parse, and return the text. Use for supplier invoices where data lives in the PDF (Moco Net/GST figures, Big Michael\'s line items, CCA totals, Norkatu). Get message_id + attachment_id from list_supplier_invoice_emails. Safe for large PDFs — bytes never leave Railway.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message_id: { type: 'string', description: 'Gmail message ID containing the PDF attachment.' },
+        attachment_id: { type: 'string', description: 'Gmail attachmentId (from list_supplier_invoice_emails).' },
+        max_chars: { type: 'number', description: 'Max characters of extracted text to return. Defaults to 50000.' },
       },
-      attachmentId: {
-        type: 'string',
-        description: 'Gmail attachmentId (from list_supplier_invoice_emails).',
-      },
-      maxChars: {
-        type: 'number',
-        description: 'Max characters of extracted text to return. Defaults to 50000.',
-      },
+      required: ['message_id', 'attachment_id'],
     },
-    required: ['messageId', 'attachmentId'],
   },
-},
 ];
 
 async function executeTool(name, params) {
@@ -1128,56 +1145,7 @@ async function executeTool(name, params) {
       if (params.to_date) qs.set('toDate', params.to_date);
       if (params.bank_account_code) qs.set('bankAccountCode', params.bank_account_code);
       return (await axios.get(`${BASE}/api/xero-search-spend-money?${qs}`)).data;
-    }async function extractPdfTextFromGmail({ messageId, attachmentId, maxChars = 50000 }) {
-  if (!messageId || !attachmentId) {
-    throw new Error('messageId and attachmentId are required');
-case 'extract_gmail_pdf_text':
-      return await extractPdfTextFromGmail(args);
-  }
-
-  const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id: process.env.GMAIL_CLIENT_ID,
-      client_secret: process.env.GMAIL_CLIENT_SECRET,
-      refresh_token: process.env.GMAIL_REFRESH_TOKEN,
-      grant_type: 'refresh_token',
-    }),
-  });
-  const tokenData = await tokenRes.json();
-  if (!tokenRes.ok) {
-    throw new Error(`Gmail token refresh failed: ${JSON.stringify(tokenData)}`);
-  }
-  const accessToken = tokenData.access_token;
-
-  const attachRes = await fetch(
-    `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}/attachments/${attachmentId}`,
-    { headers: { Authorization: `Bearer ${accessToken}` } }
-  );
-  if (!attachRes.ok) {
-    const body = await attachRes.text();
-    throw new Error(`Gmail attachment fetch failed (${attachRes.status}): ${body}`);
-  }
-  const attachData = await attachRes.json();
-
-  const b64 = attachData.data.replace(/-/g, '+').replace(/_/g, '/');
-  const pdfBuffer = Buffer.from(b64, 'base64');
-
-  const parsed = await pdf(pdfBuffer);
-  const text = parsed.text.length > maxChars
-    ? parsed.text.slice(0, maxChars) + '\n[...truncated]'
-    : parsed.text;
-
-  return {
-    messageId,
-    attachmentId,
-    pageCount: parsed.numpages,
-    bytes: pdfBuffer.length,
-    charsReturned: text.length,
-    text,
-  };
-}
+    }
     case 'create_spend_money':
       return (await axios.post(`${BASE}/api/xero-create-spend-money`, {
         payeeName: params.payee_name,
@@ -1233,6 +1201,12 @@ case 'extract_gmail_pdf_text':
         gmailMessageId: params.gmail_message_id,
         filename: params.filename,
       })).data;
+    case 'extract_gmail_pdf_text':
+      return await extractPdfTextFromGmail({
+        messageId: params.message_id,
+        attachmentId: params.attachment_id,
+        maxChars: params.max_chars,
+      });
     default: throw new Error(`Unknown tool: ${name}`);
   }
 }
