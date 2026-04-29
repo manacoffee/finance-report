@@ -2046,7 +2046,13 @@ app.get('/sse', requireBearerOrQuery, (req, res) => {
   mcpSessions.set(sessionId, { res, lastActivity: Date.now() });
   console.log(`MCP session opened: ${sessionId}`);
   // Endpoint URI includes the session ID; the auth happens on /messages too.
-  res.write(`event: endpoint\ndata: /messages?sessionId=${sessionId}\n\n`);
+  // Forward the same auth (header or ?auth=) into the /messages endpoint
+  // path. Claude POSTs tool calls to whatever URL we emit here, and we still
+  // require auth on /messages — so it has to be in the URL.
+  const auth = (req.headers.authorization || '').match(/^Bearer\s+(.+)$/i);
+  const authParam = auth ? auth[1].trim() : (typeof req.query.auth === 'string' ? req.query.auth : '');
+  const messagesPath = `/messages?sessionId=${sessionId}` + (authParam ? `&auth=${encodeURIComponent(authParam)}` : '');
+  res.write(`event: endpoint\ndata: ${messagesPath}\n\n`);
   const ping = setInterval(() => {
     if (!res.writableEnded) res.write(': ping\n\n');
     else clearInterval(ping);
