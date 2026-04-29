@@ -1,34 +1,360 @@
+/**
+ * Mana Coffee — Xero / Gmail / MCP server
+ *
+ * This is the hardened v2 of server.js. Major changes vs the original:
+ *
+ *  Security
+ *    - Shared-secret bearer auth on /sse, /messages, /api/* (except OAuth flows)
+ *    - OAuth `state` is now a single-use random token validated on callback (CSRF fix)
+ *    - CORS locked to an explicit allowlist (no more `*`)
+ *    - Xero where-clause inputs escape `\` before `"` (prior code only escaped `"`)
+ *    - Catch-all `*` route no longer swallows `/api/*` typos
+ *
+ *  Correctness / robustness
+ *    - Bills now created as DRAFT (matches the workflow doc; was AUTHORISED in original)
+ *    - Token refresh has a single-flight lock (prevents two parallel refreshes invalidating each other)
+ *    - Tokens are persisted to a JSON file (TOKEN_STORE_PATH) on every rotation,
+ *      so they survive Railway redeploys IF a volume is mounted at that path.
+ *      Falls back to env vars on first boot.
+ *    - Idempotency-Key sent to Xero on create_bill / create_spend_money — protects
+ *      against retry-induced double-creates
+ *    - update_xero_bill: contact change is verified post-write; null `reference` clears the field
+ *    - extract_gmail_email_body returns BOTH plain and stripped-HTML, and lets
+ *      the caller pick (CCA needs HTML; Stel/most others are fine on plain)
+ *    - Gmail message-list fetch uses bounded concurrency + Promise.allSettled
+ *      (was unbounded Promise.all, which fails-all on a single 5xx)
+ *    - PDF size capped before pdf-parse runs (was unbounded; DOS risk)
+ *    - UTF-8-safe truncation for extracted text (was splitting surrogate pairs)
+ *    - All axios calls have a 60s timeout (was none — could hang forever)
+ *    - JSON body limit dropped from 50mb to 15mb (still fits any real receipt)
+ *    - executeTool now calls handler functions directly instead of looping back via localhost HTTP
+ *    - mcpSessions Map gets periodic cleanup (was leaking on dropped connections that didn't fire 'close')
+ *    - All endpoints redact base64 from console logs
+ *
+ *  Required env vars (in addition to the original Xero/Gmail/Anthropic ones):
+ *    MCP_SHARED_SECRET    - Long random string. Required on Authorization: Bearer <secret>
+ *                           for /sse, /messages, /api/*. Set in Claude's connector config.
+ *    PUBLIC_BASE_URL      - Optional. Used for log messages. Defaults to http://localhost:PORT.
+ *    ALLOWED_ORIGINS      - Optional. Comma-separated CORS origins for the web UI.
+ *                           Empty = no CORS (MCP doesn't need it).
+ *    TOKEN_STORE_PATH     - Optional. Defaults to /data/tokens.json. Mount a Railway
+ *                           volume at /data for cross-redeploy persistence.
+ *    MAX_PDF_BYTES        - Optional. Default 25_000_000 (25 MB).
+ */
+
 const express = require('express');
 const axios = require('axios');
 const path = require('path');
-const { randomUUID } = require('crypto');
+const fs = require('fs');
+const { randomUUID, randomBytes, timingSafeEqual, createHash } = require('crypto');
 const pdf = require('pdf-parse');
 
+// ──────────────────────────────────────────────────────────────────────────
+// Config
+// ──────────────────────────────────────────────────────────────────────────
+
+const PORT = process.env.PORT || 3000;
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
+const MCP_SHARED_SECRET = process.env.MCP_SHARED_SECRET || '';
+const TOKEN_STORE_PATH = process.env.TOKEN_STORE_PATH || '/data/tokens.json';
+const MAX_PDF_BYTES = Number(process.env.MAX_PDF_BYTES) || 25_000_000;
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
+if (!MCP_SHARED_SECRET || MCP_SHARED_SECRET.length < 32) {
+  console.error('FATAL: MCP_SHARED_SECRET env var is required and must be ≥32 chars.');
+  console.error('Generate one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
+  process.exit(1);
+}
+
+// Default 60s timeout on every axios call. Prior code had none — a slow
+// Xero/Gmail response would hang the request handler indefinitely.
+axios.defaults.timeout = 60_000;
+
+// ──────────────────────────────────────────────────────────────────────────
+// Token persistence
+// ──────────────────────────────────────────────────────────────────────────
+//
+// Tokens are written to TOKEN_STORE_PATH on every rotation. On Railway you
+// MUST mount a persistent volume at that path's directory (e.g. /data) for
+// these to survive redeploys. Without a volume, tokens fall back to env
+// vars on each boot, which means the first refresh after a redeploy uses
+// the old env-var token — usually fine because Xero doesn't always rotate,
+// but unreliable.
+
+function loadTokenStore() {
+  try {
+    if (fs.existsSync(TOKEN_STORE_PATH)) {
+      const data = JSON.parse(fs.readFileSync(TOKEN_STORE_PATH, 'utf8'));
+      console.log(`Loaded persisted tokens from ${TOKEN_STORE_PATH}`);
+      return {
+        xero: data.xero || {},
+        gmail: data.gmail || {},
+      };
+    } else {
+      console.log(`No persisted token store at ${TOKEN_STORE_PATH}; falling back to env vars`);
+    }
+  } catch (e) {
+    console.error('Failed to load token store, falling back to env vars:', e.message);
+  }
+  return {
+    xero: {
+      refreshToken: process.env.XERO_REFRESH_TOKEN || null,
+      tenantId: process.env.XERO_TENANT_ID || null,
+    },
+    gmail: {
+      refreshToken: process.env.GMAIL_REFRESH_TOKEN || null,
+    },
+  };
+}
+
+function saveTokenStore() {
+  try {
+    const dir = path.dirname(TOKEN_STORE_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const payload = JSON.stringify({
+      xero: {
+        refreshToken: xeroStore.refreshToken,
+        tenantId: xeroStore.tenantId,
+        // We don't persist accessToken — it's short-lived and re-derived on boot
+      },
+      gmail: {
+        refreshToken: gmailStore.refreshToken,
+      },
+      savedAt: new Date().toISOString(),
+    }, null, 2);
+    // Atomic write: write to temp, then rename. Avoids partial-write corruption
+    // if the process is killed mid-write.
+    const tmpPath = TOKEN_STORE_PATH + '.tmp';
+    fs.writeFileSync(tmpPath, payload, { mode: 0o600 });
+    fs.renameSync(tmpPath, TOKEN_STORE_PATH);
+  } catch (e) {
+    // Persistence failure is non-fatal — server continues, tokens just won't
+    // survive a restart. Log loudly so it gets noticed.
+    console.error('TOKEN PERSISTENCE FAILED:', e.message);
+    console.error('Tokens will not survive a restart. Mount a volume at ' + path.dirname(TOKEN_STORE_PATH));
+  }
+}
+
+const _initialTokens = loadTokenStore();
+let xeroStore = {
+  accessToken: null,
+  refreshToken: _initialTokens.xero.refreshToken,
+  tenantId: _initialTokens.xero.tenantId,
+  expiresAt: 0,
+};
+let gmailStore = {
+  accessToken: null,
+  refreshToken: _initialTokens.gmail.refreshToken,
+  expiresAt: 0,
+};
+
+// ──────────────────────────────────────────────────────────────────────────
+// Auth: shared-secret bearer middleware + OAuth state CSRF
+// ──────────────────────────────────────────────────────────────────────────
+
+function timingSafeStringEquals(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const ab = Buffer.from(a, 'utf8');
+  const bb = Buffer.from(b, 'utf8');
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+function requireBearer(req, res, next) {
+  const auth = req.headers.authorization || '';
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m || !timingSafeStringEquals(m[1].trim(), MCP_SHARED_SECRET)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
+
+// SSE clients can't always set headers (EventSource API). Allow secret via
+// query string as a fallback, but only over HTTPS in production.
+function requireBearerOrQuery(req, res, next) {
+  const auth = req.headers.authorization || '';
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  const headerSecret = m ? m[1].trim() : null;
+  const querySecret = typeof req.query.auth === 'string' ? req.query.auth : null;
+  const candidate = headerSecret || querySecret;
+  if (!candidate || !timingSafeStringEquals(candidate, MCP_SHARED_SECRET)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
+
+// OAuth state: single-use random tokens that bind the callback to the
+// originating /api/*-auth request. Prevents CSRF-style code injection.
+const oauthStates = new Map(); // state -> { provider, expiresAt }
+
+function generateOAuthState(provider) {
+  const state = randomBytes(32).toString('hex');
+  oauthStates.set(state, { provider, expiresAt: Date.now() + 10 * 60_000 });
+  return state;
+}
+
+function validateOAuthState(state, expectedProvider) {
+  if (typeof state !== 'string' || !state) return false;
+  const entry = oauthStates.get(state);
+  if (!entry) return false;
+  oauthStates.delete(state); // single-use
+  if (entry.expiresAt < Date.now()) return false;
+  return entry.provider === expectedProvider;
+}
+
+// Sweep expired states periodically to bound memory.
+setInterval(() => {
+  const now = Date.now();
+  for (const [state, entry] of oauthStates.entries()) {
+    if (entry.expiresAt < now) oauthStates.delete(state);
+  }
+}, 5 * 60_000).unref();
+
+// ──────────────────────────────────────────────────────────────────────────
+// Express app, CORS, body parsing
+// ──────────────────────────────────────────────────────────────────────────
+
 const app = express();
+
+// CORS: only set headers if origin is in allowlist. The MCP transport doesn't
+// use CORS (Claude calls server-to-server), so an empty allowlist is fine.
+// The web UI hosted on the same Railway URL is same-origin and also doesn't
+// need CORS.
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  }
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
-app.use(express.json({ limit: '50mb' }));
+
+// 15mb is enough for any legitimate receipt photo (typical ~3MB raw, ~4MB
+// base64). The original 50mb was a DOS vector.
+app.use(express.json({ limit: '15mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-let xeroStore = {
-  accessToken: null,
-  refreshToken: process.env.XERO_REFRESH_TOKEN || null,
-  tenantId: process.env.XERO_TENANT_ID || null,
-  expiresAt: 0,
-};
+// Async route wrapper — pipes thrown errors into the global error handler
+// instead of leaving promises unhandled.
+const asyncRoute = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
 
-let gmailStore = {
-  accessToken: null,
-  refreshToken: process.env.GMAIL_REFRESH_TOKEN || null,
-  expiresAt: 0,
-};
+// ──────────────────────────────────────────────────────────────────────────
+// Helpers
+// ──────────────────────────────────────────────────────────────────────────
 
-const mcpSessions = new Map();
+function xeroHeaders(token, tenantId, extra = {}) {
+  return {
+    Authorization: `Bearer ${token}`,
+    'xero-tenant-id': tenantId,
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    ...extra,
+  };
+}
+
+function gmailHeaders(token) {
+  return { Authorization: `Bearer ${token}`, Accept: 'application/json' };
+}
+
+// Decode a base64url string into a Buffer. Gmail returns attachment data
+// and raw message bodies in base64url encoding (RFC 4648 §5).
+function base64urlDecode(str) {
+  const pad = str.length % 4 === 2 ? '==' : str.length % 4 === 3 ? '=' : '';
+  return Buffer.from(str.replace(/-/g, '+').replace(/_/g, '/') + pad, 'base64');
+}
+
+// Escape a value for inclusion inside a Xero where-clause double-quoted
+// string. Order matters: backslash first, then quote.
+function xeroWhereEscape(value) {
+  return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+// Escape regex metacharacters in user input.
+function escapeRegex(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Truncate a string to roughly `maxChars` UTF-16 code units, but don't split
+// a surrogate pair. Appends a [...truncated] marker.
+function truncateText(str, maxChars) {
+  if (typeof str !== 'string') return '';
+  if (str.length <= maxChars) return str;
+  let end = maxChars;
+  const codeAtEnd = str.charCodeAt(end - 1);
+  // High surrogate? Drop it so we don't leave a half-pair.
+  if (codeAtEnd >= 0xD800 && codeAtEnd <= 0xDBFF) end--;
+  return str.slice(0, end) + '\n[...truncated]';
+}
+
+// Bounded-concurrency map. Returns Promise.allSettled-style results: each
+// entry is { status: 'fulfilled', value } or { status: 'rejected', reason }.
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  async function worker() {
+    while (true) {
+      const i = nextIndex++;
+      if (i >= items.length) return;
+      try {
+        results[i] = { status: 'fulfilled', value: await fn(items[i], i) };
+      } catch (err) {
+        results[i] = { status: 'rejected', reason: err };
+      }
+    }
+  }
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
+// Idempotency keys derived from logical identity of the create. Xero
+// dedupes within a 24-hour window when this header is sent. Protects
+// against retry-induced double-creates.
+function idempotencyKeyForBill(supplierName, invoiceNumber) {
+  const seed = `bill:v1:${supplierName}:${invoiceNumber}`;
+  return createHash('sha256').update(seed).digest('hex');
+}
+function idempotencyKeyForSpend(payeeName, transactionDate, reference, total) {
+  const seed = `spend:v1:${payeeName}:${transactionDate}:${reference || ''}:${total || ''}`;
+  return createHash('sha256').update(seed).digest('hex');
+}
+
+// Headers helper that strips potentially huge fields (base64) before logging.
+function redactForLog(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const clone = Array.isArray(obj) ? [...obj] : { ...obj };
+  for (const key of Object.keys(clone)) {
+    if (/base64|content/i.test(key) && typeof clone[key] === 'string' && clone[key].length > 200) {
+      clone[key] = `[redacted ${clone[key].length} chars]`;
+    } else if (typeof clone[key] === 'object' && clone[key] !== null) {
+      clone[key] = redactForLog(clone[key]);
+    }
+  }
+  return clone;
+}
+
+function logSection(label, body) {
+  console.log(`═══ ${label} ═══`);
+  if (body !== undefined) console.log(JSON.stringify(redactForLog(body), null, 2));
+}
+function logError(label, err) {
+  console.error(`═══ ${label} ERROR ═══`);
+  console.error('Status:', err.response?.status);
+  console.error('Data:', JSON.stringify(err.response?.data, null, 2));
+  console.error('Message:', err.message);
+  console.error('═══════════════════════');
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Token refresh — single-flight locked so parallel callers don't race
+// ──────────────────────────────────────────────────────────────────────────
+
+let xeroRefreshInFlight = null;
 
 async function getValidToken() {
   if (xeroStore.accessToken && Date.now() < xeroStore.expiresAt - 60_000) {
@@ -37,23 +363,43 @@ async function getValidToken() {
   if (!xeroStore.refreshToken) {
     throw new Error('Not connected to Xero — please visit /api/xero-auth to reconnect');
   }
-  const r = await axios.post(
-    'https://identity.xero.com/connect/token',
-    new URLSearchParams({ grant_type: 'refresh_token', refresh_token: xeroStore.refreshToken }),
-    {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Authorization: `Basic ${Buffer.from(
-          `${process.env.XERO_CLIENT_ID}:${process.env.XERO_CLIENT_SECRET}`
-        ).toString('base64')}`,
-      },
+  // If a refresh is already running, await it instead of starting another.
+  // Without this lock, two parallel callers each refresh, each gets a new
+  // refresh_token, the second overwrites the first, and the first's response
+  // ends up holding a token Xero has already invalidated.
+  if (xeroRefreshInFlight) return xeroRefreshInFlight;
+
+  xeroRefreshInFlight = (async () => {
+    try {
+      const r = await axios.post(
+        'https://identity.xero.com/connect/token',
+        new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: xeroStore.refreshToken,
+        }),
+        {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${Buffer.from(
+              `${process.env.XERO_CLIENT_ID}:${process.env.XERO_CLIENT_SECRET}`
+            ).toString('base64')}`,
+          },
+        }
+      );
+      xeroStore.accessToken = r.data.access_token;
+      xeroStore.refreshToken = r.data.refresh_token || xeroStore.refreshToken;
+      xeroStore.expiresAt = Date.now() + r.data.expires_in * 1_000;
+      saveTokenStore();
+      return { token: xeroStore.accessToken, tenantId: xeroStore.tenantId };
+    } finally {
+      xeroRefreshInFlight = null;
     }
-  );
-  xeroStore.accessToken = r.data.access_token;
-  xeroStore.refreshToken = r.data.refresh_token;
-  xeroStore.expiresAt = Date.now() + r.data.expires_in * 1_000;
-  return { token: xeroStore.accessToken, tenantId: xeroStore.tenantId };
+  })();
+
+  return xeroRefreshInFlight;
 }
+
+let gmailRefreshInFlight = null;
 
 async function getValidGmailToken() {
   if (gmailStore.accessToken && Date.now() < gmailStore.expiresAt - 60_000) {
@@ -62,66 +408,57 @@ async function getValidGmailToken() {
   if (!gmailStore.refreshToken) {
     throw new Error('Not connected to Gmail — please visit /api/gmail-auth to connect');
   }
-  const r = await axios.post(
-    'https://oauth2.googleapis.com/token',
-    new URLSearchParams({
-      grant_type: 'refresh_token',
-      refresh_token: gmailStore.refreshToken,
-      client_id: process.env.GMAIL_CLIENT_ID,
-      client_secret: process.env.GMAIL_CLIENT_SECRET,
-    }),
-    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-  );
-  gmailStore.accessToken = r.data.access_token;
-  // Google only returns a new refresh_token occasionally; keep the old one if not returned
-  if (r.data.refresh_token) gmailStore.refreshToken = r.data.refresh_token;
-  gmailStore.expiresAt = Date.now() + r.data.expires_in * 1_000;
-  return gmailStore.accessToken;
+  if (gmailRefreshInFlight) return gmailRefreshInFlight;
+
+  gmailRefreshInFlight = (async () => {
+    try {
+      const r = await axios.post(
+        'https://oauth2.googleapis.com/token',
+        new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: gmailStore.refreshToken,
+          client_id: process.env.GMAIL_CLIENT_ID,
+          client_secret: process.env.GMAIL_CLIENT_SECRET,
+        }),
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+      );
+      gmailStore.accessToken = r.data.access_token;
+      // Google rotates refresh tokens rarely; keep the existing one if not returned.
+      if (r.data.refresh_token) gmailStore.refreshToken = r.data.refresh_token;
+      gmailStore.expiresAt = Date.now() + r.data.expires_in * 1_000;
+      saveTokenStore();
+      return gmailStore.accessToken;
+    } finally {
+      gmailRefreshInFlight = null;
+    }
+  })();
+
+  return gmailRefreshInFlight;
 }
 
-function gmailHeaders(token) {
-  return { Authorization: `Bearer ${token}`, Accept: 'application/json' };
-}
-
-// Decode a base64url string into a Buffer. Gmail API returns attachment data
-// and raw message bodies in base64url encoding (RFC 4648 §5).
-function base64urlDecode(str) {
-  const pad = str.length % 4 === 2 ? '==' : str.length % 4 === 3 ? '=' : '';
-  return Buffer.from(str.replace(/-/g, '+').replace(/_/g, '/') + pad, 'base64');
-}
-
-function xeroHeaders(token, tenantId) {
-  return {
-    Authorization: `Bearer ${token}`,
-    'xero-tenant-id': tenantId,
-    Accept: 'application/json',
-    'Content-Type': 'application/json',
-  };
-}
-
-function parseCookies(req) {
-  return Object.fromEntries(
-    (req.headers.cookie || '').split('; ').filter(Boolean).map(c => {
-      const [k, ...v] = c.split('=');
-      return [k, v.join('=')];
-    })
-  );
-}
+// ──────────────────────────────────────────────────────────────────────────
+// OAuth: Xero
+// ──────────────────────────────────────────────────────────────────────────
 
 app.get('/api/xero-auth', (req, res) => {
+  const state = generateOAuthState('xero');
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: process.env.XERO_CLIENT_ID,
     redirect_uri: process.env.XERO_REDIRECT_URI,
     scope: 'openid profile email offline_access accounting.invoices accounting.contacts accounting.banktransactions accounting.settings.read accounting.reports.profitandloss.read accounting.attachments',
-    state: 'finance_report',
+    state,
   });
   res.redirect(`https://login.xero.com/identity/connect/authorize?${params}`);
 });
 
-app.get('/api/xero-callback', async (req, res) => {
-  const { code, error } = req.query;
-  if (error || !code) return res.redirect('/?xero=error');
+app.get('/api/xero-callback', asyncRoute(async (req, res) => {
+  const { code, state, error } = req.query;
+  if (error || !code) return res.redirect('/?xero=error&reason=no_code');
+  if (!validateOAuthState(state, 'xero')) {
+    console.error('Xero callback: invalid or expired state token. Possible CSRF.');
+    return res.redirect('/?xero=error&reason=bad_state');
+  }
   try {
     const tokenRes = await axios.post(
       'https://identity.xero.com/connect/token',
@@ -144,50 +481,50 @@ app.get('/api/xero-callback', async (req, res) => {
       headers: { Authorization: `Bearer ${access_token}` },
     });
     const tenantId = tenantsRes.data[0]?.tenantId;
-    if (!tenantId) throw new Error('No Xero organisation found');
+    if (!tenantId) throw new Error('No Xero organisation found on this account');
     xeroStore = {
       accessToken: access_token,
       refreshToken: refresh_token,
       tenantId,
       expiresAt: Date.now() + expires_in * 1_000,
     };
-    const maxAge = 60 * 60 * 24 * 30;
-    res.setHeader('Set-Cookie', [
-      `xero_access_token=${access_token}; HttpOnly; Path=/; Max-Age=${expires_in}; SameSite=Lax`,
-      `xero_refresh_token=${refresh_token}; HttpOnly; Path=/; Max-Age=${maxAge}; SameSite=Lax`,
-      `xero_tenant_id=${tenantId}; HttpOnly; Path=/; Max-Age=${maxAge}; SameSite=Lax`,
-    ]);
+    saveTokenStore();
     res.redirect('/?xero=connected');
   } catch (err) {
-    console.error('Xero callback error:', err.response?.data || err.message);
+    logError('XERO CALLBACK', err);
     res.redirect('/?xero=error');
   }
-});
+}));
 
-// ─── Gmail OAuth ──────────────────────────────────────────────────────────
-// Full OAuth 2.0 flow for `brisbane@manacoffee.net`. Used to fetch PDF
-// invoice attachments server-side so Claude doesn't have to pass them
-// through the MCP tool as base64.
+// ──────────────────────────────────────────────────────────────────────────
+// OAuth: Gmail
+// ──────────────────────────────────────────────────────────────────────────
+
 app.get('/api/gmail-auth', (req, res) => {
   if (!process.env.GMAIL_CLIENT_ID || !process.env.GMAIL_REDIRECT_URI) {
     return res.status(500).send('Gmail OAuth not configured — GMAIL_CLIENT_ID / GMAIL_REDIRECT_URI env vars missing.');
   }
+  const state = generateOAuthState('gmail');
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: process.env.GMAIL_CLIENT_ID,
     redirect_uri: process.env.GMAIL_REDIRECT_URI,
     scope: 'https://www.googleapis.com/auth/gmail.readonly',
     access_type: 'offline',
-    prompt: 'consent',         // force refresh_token issuance
+    prompt: 'consent',
     include_granted_scopes: 'true',
-    state: 'finance_report',
+    state,
   });
   res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params}`);
 });
 
-app.get('/api/gmail-callback', async (req, res) => {
-  const { code, error } = req.query;
-  if (error || !code) return res.redirect('/?gmail=error');
+app.get('/api/gmail-callback', asyncRoute(async (req, res) => {
+  const { code, state, error } = req.query;
+  if (error || !code) return res.redirect('/?gmail=error&reason=no_code');
+  if (!validateOAuthState(state, 'gmail')) {
+    console.error('Gmail callback: invalid or expired state token. Possible CSRF.');
+    return res.redirect('/?gmail=error&reason=bad_state');
+  }
   try {
     const tokenRes = await axios.post(
       'https://oauth2.googleapis.com/token',
@@ -202,9 +539,7 @@ app.get('/api/gmail-callback', async (req, res) => {
     );
     const { access_token, refresh_token, expires_in } = tokenRes.data;
     if (!refresh_token) {
-      // Google only returns refresh_token when prompt=consent AND the user has
-      // not previously granted this scope. If missing, re-consent is required.
-      console.error('Gmail callback: no refresh_token returned. Revoke the app at https://myaccount.google.com/permissions and re-authorise.');
+      console.error('Gmail callback: no refresh_token. Revoke at https://myaccount.google.com/permissions and re-auth.');
       return res.redirect('/?gmail=error&reason=no_refresh_token');
     }
     gmailStore = {
@@ -212,374 +547,349 @@ app.get('/api/gmail-callback', async (req, res) => {
       refreshToken: refresh_token,
       expiresAt: Date.now() + expires_in * 1_000,
     };
+    saveTokenStore();
     res.redirect('/?gmail=connected');
   } catch (err) {
-    console.error('Gmail callback error:', err.response?.data || err.message);
+    logError('GMAIL CALLBACK', err);
     res.redirect('/?gmail=error');
   }
-});
+}));
 
-app.get('/api/xero-labour', async (req, res) => {
-  const { fromDate, toDate } = req.query;
-  if (!fromDate || !toDate) return res.status(400).json({ error: 'fromDate and toDate required' });
-  const cookies = parseCookies(req);
-  let accessToken = cookies.xero_access_token;
-  const refreshToken = cookies.xero_refresh_token;
-  const tenantId = cookies.xero_tenant_id;
-  if (!tenantId || !refreshToken) return res.status(401).json({ error: 'Not connected to Xero' });
-  if (!accessToken) {
-    try {
-      const r = await axios.post(
-        'https://identity.xero.com/connect/token',
-        new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }),
-        {
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            Authorization: `Basic ${Buffer.from(
-              `${process.env.XERO_CLIENT_ID}:${process.env.XERO_CLIENT_SECRET}`
-            ).toString('base64')}`,
-          },
-        }
-      );
-      accessToken = r.data.access_token;
-      res.setHeader('Set-Cookie', [
-        `xero_access_token=${accessToken}; HttpOnly; Path=/; Max-Age=${r.data.expires_in}; SameSite=Lax`,
-        `xero_refresh_token=${r.data.refresh_token}; HttpOnly; Path=/; Max-Age=${60 * 60 * 24 * 30}; SameSite=Lax`,
-      ]);
-    } catch {
-      return res.status(401).json({ error: 'Xero session expired — please reconnect' });
-    }
-  }
-  try {
-    const LABOUR_KEYWORDS = ['wage', 'labour', 'labor', 'payroll', 'salary', 'salaries', 'superannuation', 'super'];
-    const plRes = await axios.get(
-      `https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?fromDate=${fromDate}&toDate=${toDate}&standardLayout=true`,
-      { headers: { Authorization: `Bearer ${accessToken}`, 'xero-tenant-id': tenantId, Accept: 'application/json' } }
-    );
-    const rows = plRes.data?.Reports?.[0]?.Rows || [];
-    let labourExGST = 0;
-    const walk = rows => {
-      for (const row of rows) {
-        if (row.Rows) walk(row.Rows);
-        if (row.Cells) {
-          const name = (row.Cells[0]?.Value || '').toLowerCase();
-          const amt = parseFloat(row.Cells[1]?.Value) || 0;
-          if (LABOUR_KEYWORDS.some(k => name.includes(k))) labourExGST += Math.abs(amt);
-        }
-      }
-    };
-    walk(rows);
-    res.json({ labourExGST: parseFloat(labourExGST.toFixed(2)) });
-  } catch (err) {
-    console.error('Xero P&L error:', err.response?.data || err.message);
-    res.status(500).json({ error: 'Failed to fetch Xero data' });
-  }
-});
+// ──────────────────────────────────────────────────────────────────────────
+// Xero handler functions — these are called both by Express routes AND by
+// executeTool() (no localhost loopback). All error handling is at the
+// caller level via asyncRoute.
+// ──────────────────────────────────────────────────────────────────────────
 
-app.post('/api/parse-invoice', async (req, res) => {
-  const { base64, filename } = req.body;
-  if (!base64) return res.status(400).json({ error: 'No file data' });
-  const SUPPLIERS = {
-    stel: 'coffee', norkatu: 'coffee', moco: 'food', fresho: 'food',
-    'big michaels': 'food', 'coca cola': 'food', 'coca-cola': 'food', ordermentum: 'food',
+async function xeroCheckInvoice(invoiceNumber) {
+  if (!invoiceNumber) {
+    const err = new Error('invoiceNumber required');
+    err.status = 400;
+    throw err;
+  }
+  const { token, tenantId } = await getValidToken();
+
+  // 1. Purchase bills (ACCPAY) — exact match supported
+  const billsRes = await axios.get(
+    `https://api.xero.com/api.xro/2.0/Invoices?InvoiceNumbers=${encodeURIComponent(invoiceNumber)}&Type=ACCPAY`,
+    { headers: xeroHeaders(token, tenantId) }
+  );
+  const invoices = billsRes.data.Invoices || [];
+  const activeBills = invoices.filter(i => i.Status !== 'VOIDED' && i.Status !== 'DELETED');
+  const bill = activeBills[0] || null;
+
+  // 2. Spend Money — Xero only supports Contains() in where-clause for Reference,
+  //    so we fetch candidates then post-filter with a word-boundary regex to
+  //    avoid `INV-1234` matching `INV-12345`.
+  const safe = xeroWhereEscape(invoiceNumber);
+  const spendWhere = `Type=="SPEND" AND Reference!=null AND Reference.Contains("${safe}")`;
+  const spendRes = await axios.get(
+    `https://api.xero.com/api.xro/2.0/BankTransactions?where=${encodeURIComponent(spendWhere)}`,
+    { headers: xeroHeaders(token, tenantId) }
+  );
+  const candidates = (spendRes.data.BankTransactions || [])
+    .filter(t => t.Status !== 'DELETED' && t.Status !== 'VOIDED');
+  // Word-boundary match: invoice number must be bounded by start/end of string
+  // or by a non-alphanumeric character. Catches both "INV-1234" and bare "1234"
+  // without false-positives on "1234567".
+  const boundary = new RegExp(`(^|[^A-Za-z0-9])${escapeRegex(invoiceNumber)}([^A-Za-z0-9]|$)`);
+  const spendTxs = candidates.filter(t => boundary.test(t.Reference || ''));
+  const spend = spendTxs[0] || null;
+
+  const existsAsBill = !!bill;
+  const existsAsSpendMoney = !!spend;
+
+  return {
+    exists: existsAsBill || existsAsSpendMoney,
+    status: bill?.Status || spend?.Status || null,
+    invoiceId: bill?.InvoiceID || null,
+    existsAsBill,
+    bill: bill ? {
+      invoiceId: bill.InvoiceID, status: bill.Status, total: bill.Total,
+      date: bill.Date, contact: bill.Contact?.Name,
+    } : null,
+    existsAsSpendMoney,
+    spendMoney: spend ? {
+      bankTransactionId: spend.BankTransactionID, status: spend.Status,
+      total: spend.Total, date: spend.Date,
+      reference: spend.Reference, contact: spend.Contact?.Name,
+    } : null,
+    spendMoneyMatches: spendTxs.length,
+    spendMoneyCandidatesPreFilter: candidates.length,
   };
-  const categFromSupplier = name => {
-    const l = (name || '').toLowerCase();
-    for (const [k, v] of Object.entries(SUPPLIERS)) if (l.includes(k)) return v;
-    return null;
-  };
-  try {
-    const response = await axios.post(
-      'https://api.anthropic.com/v1/messages',
-      {
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1000,
-        messages: [{ role: 'user', content: [
-          { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } },
-          { type: 'text', text: 'Extract from this invoice and respond ONLY with valid JSON, no markdown:\n{"supplier":"<n>","invoice_number":"<inv#>","invoice_date":"<date>","total_inc_gst":<number>,"total_ex_gst":<number>,"gst_amount":<number>}\nUse null for missing fields.' },
-        ]}],
-      },
-      { headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' } }
-    );
-    const text = response.data.content?.map(b => b.text || '').join('') || '{}';
-    const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
-    res.json({ ...parsed, category: categFromSupplier(parsed.supplier), file: filename });
-  } catch (err) {
-    console.error('Invoice parse error:', err.message);
-    res.status(500).json({ error: 'Failed to parse invoice' });
-  }
-});
+}
 
-app.post('/api/extract-pdf-text', async (req, res) => {
-  try {
-    const result = await extractPdfTextFromGmail(req.body);
-    res.json(result);
-  } catch (err) {
-    console.error('extract-pdf-text error:', err.response?.data || err.message);
-    res.status(500).json({ error: err.response?.data?.error?.message || err.message });
-  }
-});
-
-app.post('/api/extract-email-body', async (req, res) => {
-  try {
-    const result = await extractEmailBodyFromGmail(req.body);
-    res.json(result);
-  } catch (err) {
-    console.error('extract-email-body error:', err.response?.data || err.message);
-    res.status(500).json({ error: err.response?.data?.error?.message || err.message });
-  }
-});
-
-app.post('/api/generate-report', async (req, res) => {
-  const { weekLabel, coffeeEx, foodEx, total, cogsCoEx, cogsFdEx, totalCOGS, gp, gpPct, labourEx, labourPct, txns, avg } = req.body;
-  const fmt = n => `$${Number(n).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-  const pct = (a, b) => b === 0 ? '—' : `${((a / b) * 100).toFixed(1)}%`;
-  const prompt = `You are a financial analyst for a café. Generate a concise weekly report.
-Week: ${weekLabel || 'This week'}
-Turnover Coffee: ${fmt(coffeeEx)}, Food & Bev: ${fmt(foodEx)}, Total: ${fmt(total)}
-COGS Coffee: ${fmt(cogsCoEx)} (${pct(cogsCoEx, coffeeEx)}), Food: ${fmt(cogsFdEx)} (${pct(cogsFdEx, foodEx)})
-Labour: ${fmt(labourEx)} (${Number(labourPct).toFixed(1)}% of turnover)
-Gross Profit: ${fmt(gp)} (${Number(gpPct).toFixed(1)}%), Transactions: ${Number(txns).toLocaleString()}, Avg Spend: ${fmt(avg)}
-Provide: 1) 2-sentence executive summary 2) Key highlights 3) Watch points (flag labour >35% or high COGS) 4) 2-3 recommendations. Use **bold** for section labels.`;
-  try {
-    const response = await axios.post(
-      'https://api.anthropic.com/v1/messages',
-      { model: 'claude-sonnet-4-20250514', max_tokens: 1000, messages: [{ role: 'user', content: prompt }] },
-      { headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' } }
-    );
-    res.json({ report: response.data.content?.map(b => b.text || '').join('') || '' });
-  } catch (err) {
-    console.error('AI error:', err.message);
-    res.status(500).json({ error: 'Failed to generate report' });
-  }
-});
-
-app.get('/api/xero-check-invoice', async (req, res) => {
-  console.log('═══ CHECK INVOICE REQUEST ═══');
-  console.log('Invoice number:', req.query.invoiceNumber);
-  const { invoiceNumber } = req.query;
-  if (!invoiceNumber) return res.status(400).json({ error: 'invoiceNumber required' });
-  try {
-    const { token, tenantId } = await getValidToken();
-
-    // 1. Check purchase bills (ACCPAY invoices)
-    const billsRes = await axios.get(
-      `https://api.xero.com/api.xro/2.0/Invoices?InvoiceNumbers=${encodeURIComponent(invoiceNumber)}&Type=ACCPAY`,
-      { headers: xeroHeaders(token, tenantId) }
-    );
-    const invoices = billsRes.data.Invoices || [];
-    const activeBills = invoices.filter(i => i.Status !== 'VOIDED');
-    const bill = activeBills[0] || null;
-
-    // 2. Check Spend Money bank transactions by Reference field
-    const spendWhere = `Type=="SPEND" AND Reference!=null AND Reference.Contains("${String(invoiceNumber).replace(/"/g, '\\"')}")`;
-    const spendRes = await axios.get(
-      `https://api.xero.com/api.xro/2.0/BankTransactions?where=${encodeURIComponent(spendWhere)}`,
-      { headers: xeroHeaders(token, tenantId) }
-    );
-    const spendTxs = (spendRes.data.BankTransactions || []).filter(t => t.Status !== 'DELETED' && t.Status !== 'VOIDED');
-    const spend = spendTxs[0] || null;
-
-    const existsAsBill = !!bill;
-    const existsAsSpendMoney = !!spend;
-
-    res.json({
-      // Legacy shape — kept for backwards compatibility
-      exists: existsAsBill || existsAsSpendMoney,
-      status: bill?.Status || spend?.Status || null,
-      invoiceId: bill?.InvoiceID || null,
-      // Expanded shape
-      existsAsBill,
-      bill: bill ? { invoiceId: bill.InvoiceID, status: bill.Status, total: bill.Total, date: bill.Date, contact: bill.Contact?.Name } : null,
-      existsAsSpendMoney,
-      spendMoney: spend ? { bankTransactionId: spend.BankTransactionID, status: spend.Status, total: spend.Total, date: spend.Date, reference: spend.Reference, contact: spend.Contact?.Name } : null,
-      spendMoneyMatches: spendTxs.length,
-    });
-  } catch (err) {
-    console.error('═══ CHECK INVOICE ERROR ═══');
-    console.error('Status:', err.response?.status);
-    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
-    console.error('Message:', err.message);
-    console.error('═══════════════════════════');
-    res.status(500).json({ error: err.response?.data?.Message || err.message });
-  }
-});
-
-app.get('/api/xero-search-spend-money', async (req, res) => {
-  console.log('═══ SEARCH SPEND MONEY REQUEST ═══');
-  console.log(JSON.stringify(req.query, null, 2));
-  const { reference, contactName, amount, fromDate, toDate, bankAccountCode } = req.query;
+async function xeroSearchSpendMoney(input) {
+  const { reference, contactName, amount, fromDate, toDate, bankAccountCode } = input || {};
   if (!reference && !contactName && !amount && !fromDate && !toDate) {
-    return res.status(400).json({ error: 'At least one of reference, contactName, amount, fromDate, or toDate is required' });
+    const err = new Error('At least one of reference, contactName, amount, fromDate, toDate is required');
+    err.status = 400;
+    throw err;
   }
-  try {
-    const { token, tenantId } = await getValidToken();
-
-    const clauses = ['Type=="SPEND"'];
-    if (reference) {
-      const safe = String(reference).replace(/"/g, '\\"');
-      clauses.push(`Reference!=null AND Reference.Contains("${safe}")`);
-    }
-    if (contactName) {
-      const safe = String(contactName).replace(/"/g, '\\"');
-      clauses.push(`Contact.Name.Contains("${safe}")`);
-    }
-    if (fromDate) {
-      const [y, m, d] = String(fromDate).split('-').map(Number);
-      if (y && m && d) clauses.push(`Date>=DateTime(${y},${m},${d})`);
-    }
-    if (toDate) {
-      const [y, m, d] = String(toDate).split('-').map(Number);
-      if (y && m && d) clauses.push(`Date<=DateTime(${y},${m},${d})`);
-    }
-    const where = clauses.join(' AND ');
-    const r = await axios.get(
-      `https://api.xero.com/api.xro/2.0/BankTransactions?where=${encodeURIComponent(where)}`,
-      { headers: xeroHeaders(token, tenantId) }
-    );
-    let txs = (r.data.BankTransactions || []).filter(t => t.Status !== 'DELETED' && t.Status !== 'VOIDED');
-
-    // Amount filter applied in-memory because Xero's where clause for BankTransaction Total is flaky
-    if (amount) {
-      const target = Number(amount);
-      if (!Number.isNaN(target)) {
-        txs = txs.filter(t => Math.abs(Number(t.Total) - target) < 0.02);
-      }
-    }
-
-    // Optional bank account filter (in-memory)
-    if (bankAccountCode) {
-      txs = txs.filter(t => t.BankAccount?.Code === String(bankAccountCode));
-    }
-
-    res.json({
-      count: txs.length,
-      transactions: txs.map(t => ({
-        bankTransactionId: t.BankTransactionID,
-        date: t.Date,
-        status: t.Status,
-        total: t.Total,
-        reference: t.Reference,
-        contact: t.Contact?.Name,
-        bankAccountCode: t.BankAccount?.Code,
-        bankAccountName: t.BankAccount?.Name,
-      })),
-    });
-  } catch (err) {
-    console.error('═══ SEARCH SPEND MONEY ERROR ═══');
-    console.error('Status:', err.response?.status);
-    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
-    console.error('Message:', err.message);
-    console.error('════════════════════════════════');
-    res.status(500).json({ error: err.response?.data?.Message || err.message });
+  const { token, tenantId } = await getValidToken();
+  const clauses = ['Type=="SPEND"'];
+  if (reference) {
+    clauses.push(`Reference!=null AND Reference.Contains("${xeroWhereEscape(reference)}")`);
   }
-});
+  if (contactName) {
+    clauses.push(`Contact.Name.Contains("${xeroWhereEscape(contactName)}")`);
+  }
+  if (fromDate) {
+    const [y, m, d] = String(fromDate).split('-').map(Number);
+    if (y && m && d) clauses.push(`Date>=DateTime(${y},${m},${d})`);
+  }
+  if (toDate) {
+    const [y, m, d] = String(toDate).split('-').map(Number);
+    if (y && m && d) clauses.push(`Date<=DateTime(${y},${m},${d})`);
+  }
+  const where = clauses.join(' AND ');
+  const r = await axios.get(
+    `https://api.xero.com/api.xro/2.0/BankTransactions?where=${encodeURIComponent(where)}`,
+    { headers: xeroHeaders(token, tenantId) }
+  );
+  let txs = (r.data.BankTransactions || [])
+    .filter(t => t.Status !== 'DELETED' && t.Status !== 'VOIDED');
 
-app.post('/api/xero-create-bill', async (req, res) => {
-  console.log('═══ CREATE BILL REQUEST ═══');
-  console.log(JSON.stringify(req.body, null, 2));
-  console.log('════════════════════════════');
-  const { supplierName, invoiceNumber, invoiceDate, dueDate, lineItems } = req.body;
+  if (amount !== undefined && amount !== null && amount !== '') {
+    const target = Number(amount);
+    if (!Number.isNaN(target)) {
+      txs = txs.filter(t => Math.abs(Number(t.Total) - target) < 0.02);
+    }
+  }
+  if (bankAccountCode) {
+    txs = txs.filter(t => t.BankAccount?.Code === String(bankAccountCode));
+  }
+
+  return {
+    count: txs.length,
+    transactions: txs.map(t => ({
+      bankTransactionId: t.BankTransactionID,
+      date: t.Date,
+      status: t.Status,
+      total: t.Total,
+      reference: t.Reference,
+      contact: t.Contact?.Name,
+      bankAccountCode: t.BankAccount?.Code,
+      bankAccountName: t.BankAccount?.Name,
+    })),
+  };
+}
+
+async function xeroCreateBill(input) {
+  const { supplierName, invoiceNumber, invoiceDate, dueDate, lineItems, status } = input || {};
   if (!supplierName || !invoiceNumber || !invoiceDate || !lineItems?.length) {
-    return res.status(400).json({ error: 'supplierName, invoiceNumber, invoiceDate, and lineItems are required' });
+    const err = new Error('supplierName, invoiceNumber, invoiceDate, and lineItems are required');
+    err.status = 400;
+    throw err;
   }
-  try {
-    const { token, tenantId } = await getValidToken();
+  const { token, tenantId } = await getValidToken();
+
+  // Resolve contact
+  const contactRes = await axios.get(
+    `https://api.xero.com/api.xro/2.0/Contacts?searchTerm=${encodeURIComponent(supplierName)}`,
+    { headers: xeroHeaders(token, tenantId) }
+  );
+  const contact = contactRes.data.Contacts?.[0];
+  if (!contact) {
+    const err = new Error(`Supplier "${supplierName}" not found in Xero contacts.`);
+    err.status = 404;
+    throw err;
+  }
+
+  // DRAFT by default — matches the workflow in xero-build-reference. Original
+  // code had AUTHORISED hardcoded which contradicted the doc and skipped human
+  // review. Caller can still pass status:'AUTHORISED' explicitly if needed.
+  const billStatus = (status === 'AUTHORISED' || status === 'SUBMITTED') ? status : 'DRAFT';
+
+  const idemKey = idempotencyKeyForBill(supplierName, invoiceNumber);
+
+  const r = await axios.post(
+    'https://api.xero.com/api.xro/2.0/Invoices',
+    {
+      Invoices: [{
+        Type: 'ACCPAY',
+        Contact: { ContactID: contact.ContactID },
+        InvoiceNumber: invoiceNumber,
+        Date: invoiceDate,
+        DueDate: dueDate || null,
+        Status: billStatus,
+        LineAmountTypes: 'Exclusive',
+        LineItems: lineItems.map(li => ({
+          Description: li.description,
+          Quantity: Number(li.quantity) || 1,
+          UnitAmount: Number(li.unitAmount),
+          AccountCode: String(li.accountCode),
+          TaxType: li.taxType || 'INPUT',
+        })),
+      }],
+    },
+    { headers: xeroHeaders(token, tenantId, { 'Idempotency-Key': idemKey }) }
+  );
+  const created = r.data.Invoices?.[0];
+  return {
+    success: true,
+    invoiceId: created?.InvoiceID,
+    invoiceNumber: created?.InvoiceNumber,
+    status: created?.Status,
+    total: created?.Total,
+  };
+}
+
+async function xeroUpdateBill(input) {
+  const { invoiceId, supplierName, invoiceDate, dueDate, reference, status } = input || {};
+  if (!invoiceId) {
+    const err = new Error('invoiceId required');
+    err.status = 400;
+    throw err;
+  }
+  const hasUpdate = supplierName || invoiceDate || dueDate || reference !== undefined || status;
+  if (!hasUpdate) {
+    const err = new Error('At least one field to update required: supplierName, invoiceDate, dueDate, reference, or status');
+    err.status = 400;
+    throw err;
+  }
+  const { token, tenantId } = await getValidToken();
+
+  const updated = { InvoiceID: invoiceId };
+  let intendedContactId = null;
+
+  if (supplierName) {
     const contactRes = await axios.get(
       `https://api.xero.com/api.xro/2.0/Contacts?searchTerm=${encodeURIComponent(supplierName)}`,
       { headers: xeroHeaders(token, tenantId) }
     );
     const contact = contactRes.data.Contacts?.[0];
-    if (!contact) return res.status(404).json({ error: `Supplier "${supplierName}" not found in Xero contacts.` });
-    const r = await axios.post(
-      'https://api.xero.com/api.xro/2.0/Invoices',
-      { Invoices: [{ Type: 'ACCPAY', Contact: { ContactID: contact.ContactID }, InvoiceNumber: invoiceNumber, Date: invoiceDate, DueDate: dueDate || null, Status: 'AUTHORISED', LineAmountTypes: 'Exclusive',
-        LineItems: lineItems.map(li => ({ Description: li.description, Quantity: Number(li.quantity) || 1, UnitAmount: Number(li.unitAmount), AccountCode: String(li.accountCode), TaxType: li.taxType || 'INPUT' })) }] },
-      { headers: xeroHeaders(token, tenantId) }
-    );
-    const created = r.data.Invoices?.[0];
-    res.json({ success: true, invoiceId: created?.InvoiceID, invoiceNumber: created?.InvoiceNumber, status: created?.Status, total: created?.Total });
-} catch (err) {
-    console.error('═══ CREATE BILL ERROR ═══');
-    console.error('Status:', err.response?.status);
-    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
-    console.error('Message:', err.message);
-    console.error('═════════════════════════');
-    res.status(500).json({ 
-      error: err.response?.data?.Message || err.message,
-      xeroResponse: err.response?.data,
-      xeroStatus: err.response?.status 
-    });
-  }
-});
-
-app.post('/api/xero-attach-receipt', async (req, res) => {
-  const { billId, filename, base64Content, mimeType } = req.body;
-  if (!billId || !filename || !base64Content) return res.status(400).json({ error: 'billId, filename, and base64Content are required' });
-  try {
-    const { token, tenantId } = await getValidToken();
-    const buffer = Buffer.from(base64Content, 'base64');
-    const r = await axios.post(
-      `https://api.xero.com/api.xro/2.0/Invoices/${billId}/Attachments/${encodeURIComponent(filename)}`,
-      buffer,
-      { headers: { Authorization: `Bearer ${token}`, 'xero-tenant-id': tenantId, 'Content-Type': mimeType || 'application/pdf', 'Content-Length': buffer.length }, maxBodyLength: Infinity, maxContentLength: Infinity }
-    );
-    res.json({ success: true, attachment: r.data.Attachments?.[0] });
-  } catch (err) {
-    res.status(500).json({ error: err.response?.data?.Message || err.message });
-  }
-});
-
-app.get('/api/xero-open-bills', async (req, res) => {
-  const { fromDate, toDate } = req.query;
-  try {
-    const { token, tenantId } = await getValidToken();
-    let url = 'https://api.xero.com/api.xro/2.0/Invoices?Type=ACCPAY&Statuses=DRAFT,SUBMITTED,AUTHORISED';
-    if (fromDate) url += `&fromDate=${fromDate}`;
-    if (toDate) url += `&toDate=${toDate}`;
-    const r = await axios.get(url, { headers: xeroHeaders(token, tenantId) });
-    res.json({ bills: r.data.Invoices || [] });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/xero-create-spend-money', async (req, res) => {
-  console.log('═══ CREATE SPEND MONEY REQUEST ═══');
-  console.log(JSON.stringify(req.body, null, 2));
-  console.log('══════════════════════════════════');
-  const { payeeName, transactionDate, reference, bankAccountCode, lineItems } = req.body;
-  if (!payeeName || !transactionDate || !lineItems?.length) {
-    return res.status(400).json({ error: 'payeeName, transactionDate, and lineItems are required' });
-  }
-  try {
-    const { token, tenantId } = await getValidToken();
-
-    const contactRes = await axios.get(
-      `https://api.xero.com/api.xro/2.0/Contacts?searchTerm=${encodeURIComponent(payeeName)}`,
-      { headers: xeroHeaders(token, tenantId) }
-    );
-    let contact = contactRes.data.Contacts?.[0];
     if (!contact) {
-      const newContactRes = await axios.post(
-        'https://api.xero.com/api.xro/2.0/Contacts',
-        { Contacts: [{ Name: payeeName }] },
+      const err = new Error(`Supplier "${supplierName}" not found in Xero contacts.`);
+      err.status = 404;
+      throw err;
+    }
+    intendedContactId = contact.ContactID;
+    updated.Contact = { ContactID: contact.ContactID };
+  }
+  if (invoiceDate) updated.Date = invoiceDate;
+  if (dueDate) updated.DueDate = dueDate;
+  // Allow null or "" to clear the Reference field. Xero accepts empty string.
+  if (reference !== undefined) updated.Reference = reference === null ? '' : reference;
+  if (status) updated.Status = status;
+
+  const r = await axios.post(
+    `https://api.xero.com/api.xro/2.0/Invoices/${invoiceId}`,
+    { Invoices: [updated] },
+    { headers: xeroHeaders(token, tenantId) }
+  );
+  const result = r.data.Invoices?.[0];
+
+  // Verify contact change actually took. Xero silently rejects contact changes
+  // on AUTHORISED bills in some cases; surface a warning so Claude knows.
+  let contactChangeWarning = null;
+  if (intendedContactId && result?.Contact?.ContactID !== intendedContactId) {
+    contactChangeWarning = `Contact change requested (ContactID=${intendedContactId}) but Xero stored ContactID=${result?.Contact?.ContactID}. Likely cause: the bill is AUTHORISED — change the contact in the Xero UI instead.`;
+  }
+
+  return {
+    success: !contactChangeWarning,
+    contactChangeWarning,
+    invoiceId: result?.InvoiceID,
+    invoiceNumber: result?.InvoiceNumber,
+    status: result?.Status,
+    total: result?.Total,
+    contact: result?.Contact?.Name,
+    contactId: result?.Contact?.ContactID,
+    date: result?.Date,
+    dueDate: result?.DueDate,
+    reference: result?.Reference,
+  };
+}
+
+async function xeroVoidBill(invoiceId) {
+  // Set status to DELETED. Only works on DRAFT or SUBMITTED bills; AUTHORISED
+  // must be voided via VOIDED status.
+  if (!invoiceId) {
+    const err = new Error('invoiceId required');
+    err.status = 400;
+    throw err;
+  }
+  const { token, tenantId } = await getValidToken();
+  // Try DELETED first (works on DRAFT). If that fails, try VOIDED (AUTHORISED).
+  for (const status of ['DELETED', 'VOIDED']) {
+    try {
+      const r = await axios.post(
+        `https://api.xero.com/api.xro/2.0/Invoices/${invoiceId}`,
+        { Invoices: [{ InvoiceID: invoiceId, Status: status }] },
         { headers: xeroHeaders(token, tenantId) }
       );
-      contact = newContactRes.data.Contacts?.[0];
+      const result = r.data.Invoices?.[0];
+      return { success: true, status: result?.Status, invoiceId: result?.InvoiceID };
+    } catch (err) {
+      if (status === 'VOIDED') throw err; // last attempt
+      // else fall through and try VOIDED
     }
+  }
+}
 
-    const code = String(bankAccountCode || '605');
-    const acctRes = await axios.get(
-      `https://api.xero.com/api.xro/2.0/Accounts?where=${encodeURIComponent(`Code=="${code}"`)}`,
+async function xeroDeleteSpendMoney(bankTransactionId) {
+  if (!bankTransactionId) {
+    const err = new Error('bankTransactionId required');
+    err.status = 400;
+    throw err;
+  }
+  const { token, tenantId } = await getValidToken();
+  const r = await axios.post(
+    `https://api.xero.com/api.xro/2.0/BankTransactions/${bankTransactionId}`,
+    { BankTransactions: [{ BankTransactionID: bankTransactionId, Status: 'DELETED' }] },
+    { headers: xeroHeaders(token, tenantId) }
+  );
+  const result = r.data.BankTransactions?.[0];
+  return { success: true, status: result?.Status, bankTransactionId: result?.BankTransactionID };
+}
+
+async function xeroCreateSpendMoney(input) {
+  const { payeeName, transactionDate, reference, bankAccountCode, lineItems } = input || {};
+  if (!payeeName || !transactionDate || !lineItems?.length) {
+    const err = new Error('payeeName, transactionDate, and lineItems are required');
+    err.status = 400;
+    throw err;
+  }
+  const { token, tenantId } = await getValidToken();
+
+  // Resolve or create contact
+  const contactRes = await axios.get(
+    `https://api.xero.com/api.xro/2.0/Contacts?searchTerm=${encodeURIComponent(payeeName)}`,
+    { headers: xeroHeaders(token, tenantId) }
+  );
+  let contact = contactRes.data.Contacts?.[0];
+  if (!contact) {
+    const newContactRes = await axios.post(
+      'https://api.xero.com/api.xro/2.0/Contacts',
+      { Contacts: [{ Name: payeeName }] },
       { headers: xeroHeaders(token, tenantId) }
     );
-    const bankAccount = acctRes.data.Accounts?.[0];
-    if (!bankAccount) return res.status(404).json({ error: `Bank account with code ${code} not found` });
+    contact = newContactRes.data.Contacts?.[0];
+  }
 
-    const r = await axios.post(
-      'https://api.xero.com/api.xro/2.0/BankTransactions',
-      { BankTransactions: [{
+  const code = String(bankAccountCode || '605');
+  const acctRes = await axios.get(
+    `https://api.xero.com/api.xro/2.0/Accounts?where=${encodeURIComponent(`Code=="${xeroWhereEscape(code)}"`)}`,
+    { headers: xeroHeaders(token, tenantId) }
+  );
+  const bankAccount = acctRes.data.Accounts?.[0];
+  if (!bankAccount) {
+    const err = new Error(`Bank account with code ${code} not found`);
+    err.status = 404;
+    throw err;
+  }
+
+  const totalEx = lineItems.reduce(
+    (s, li) => s + (Number(li.unitAmount) || 0) * (Number(li.quantity) || 1),
+    0
+  );
+  const idemKey = idempotencyKeyForSpend(payeeName, transactionDate, reference, totalEx.toFixed(2));
+
+  const r = await axios.post(
+    'https://api.xero.com/api.xro/2.0/BankTransactions',
+    {
+      BankTransactions: [{
         Type: 'SPEND',
         Contact: { ContactID: contact.ContactID },
         BankAccount: { AccountID: bankAccount.AccountID },
@@ -594,121 +904,81 @@ app.post('/api/xero-create-spend-money', async (req, res) => {
           AccountCode: String(li.accountCode),
           TaxType: li.taxType || 'INPUT',
         })),
-      }] },
-      { headers: xeroHeaders(token, tenantId) }
-    );
-    const created = r.data.BankTransactions?.[0];
-    res.json({
-      success: true,
-      bankTransactionId: created?.BankTransactionID,
-      status: created?.Status,
-      total: created?.Total,
-      contactId: contact.ContactID,
-    });
-  } catch (err) {
-    console.error('═══ CREATE SPEND MONEY ERROR ═══');
-    console.error('Status:', err.response?.status);
-    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
-    console.error('Message:', err.message);
-    console.error('════════════════════════════════');
-    res.status(500).json({
-      error: err.response?.data?.Message || err.message,
-      xeroResponse: err.response?.data,
-      xeroStatus: err.response?.status,
-    });
-  }
-});
+      }],
+    },
+    { headers: xeroHeaders(token, tenantId, { 'Idempotency-Key': idemKey }) }
+  );
+  const created = r.data.BankTransactions?.[0];
+  return {
+    success: true,
+    bankTransactionId: created?.BankTransactionID,
+    status: created?.Status,
+    total: created?.Total,
+    contactId: contact.ContactID,
+  };
+}
 
-app.post('/api/xero-attach-receipt-spend-money', async (req, res) => {
-  const { bankTransactionId, filename, base64Content, mimeType } = req.body;
-  if (!bankTransactionId || !filename || !base64Content) {
-    return res.status(400).json({ error: 'bankTransactionId, filename, and base64Content are required' });
-  }
-  try {
-    const { token, tenantId } = await getValidToken();
-    const buffer = Buffer.from(base64Content, 'base64');
-    const r = await axios.post(
-      `https://api.xero.com/api.xro/2.0/BankTransactions/${bankTransactionId}/Attachments/${encodeURIComponent(filename)}`,
-      buffer,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'xero-tenant-id': tenantId,
-          'Content-Type': mimeType || 'application/pdf',
-          'Content-Length': buffer.length,
-        },
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity,
-      }
-    );
-    res.json({ success: true, attachment: r.data.Attachments?.[0] });
-  } catch (err) {
-    res.status(500).json({ error: err.response?.data?.Message || err.message });
-  }
-});
+async function xeroGetOpenBills({ fromDate, toDate } = {}) {
+  const { token, tenantId } = await getValidToken();
+  let url = 'https://api.xero.com/api.xro/2.0/Invoices?Type=ACCPAY&Statuses=DRAFT,SUBMITTED,AUTHORISED';
+  if (fromDate) url += `&fromDate=${encodeURIComponent(fromDate)}`;
+  if (toDate) url += `&toDate=${encodeURIComponent(toDate)}`;
+  const r = await axios.get(url, { headers: xeroHeaders(token, tenantId) });
+  return { bills: r.data.Invoices || [] };
+}
 
-app.post('/api/xero-update-bill', async (req, res) => {
-  console.log('═══ UPDATE BILL REQUEST ═══');
-  console.log(JSON.stringify(req.body, null, 2));
-  console.log('═══════════════════════════');
-  const { invoiceId, supplierName, invoiceDate, dueDate, reference, status } = req.body;
-  if (!invoiceId) return res.status(400).json({ error: 'invoiceId required' });
-  if (!supplierName && !invoiceDate && !dueDate && reference === undefined && !status) {
-    return res.status(400).json({ error: 'At least one field to update required: supplierName, invoiceDate, dueDate, reference, or status' });
+async function xeroAttachToInvoice(billId, filename, buffer, mimeType) {
+  if (!billId || !filename || !buffer) {
+    const err = new Error('billId, filename, and buffer are required');
+    err.status = 400;
+    throw err;
   }
-  try {
-    const { token, tenantId } = await getValidToken();
-
-    // Build partial-update payload — only include fields that were provided
-    const updated = { InvoiceID: invoiceId };
-
-    if (supplierName) {
-      const contactRes = await axios.get(
-        `https://api.xero.com/api.xro/2.0/Contacts?searchTerm=${encodeURIComponent(supplierName)}`,
-        { headers: xeroHeaders(token, tenantId) }
-      );
-      const contact = contactRes.data.Contacts?.[0];
-      if (!contact) return res.status(404).json({ error: `Supplier "${supplierName}" not found in Xero contacts.` });
-      updated.Contact = { ContactID: contact.ContactID };
+  const { token, tenantId } = await getValidToken();
+  const r = await axios.post(
+    `https://api.xero.com/api.xro/2.0/Invoices/${billId}/Attachments/${encodeURIComponent(filename)}`,
+    buffer,
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'xero-tenant-id': tenantId,
+        'Content-Type': mimeType || 'application/pdf',
+        'Content-Length': buffer.length,
+      },
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
     }
-    if (invoiceDate) updated.Date = invoiceDate;
-    if (dueDate) updated.DueDate = dueDate;
-    if (reference !== undefined) updated.Reference = reference;
-    if (status) updated.Status = status;
+  );
+  return { success: true, bytesAttached: buffer.length, attachment: r.data.Attachments?.[0] };
+}
 
-    const r = await axios.post(
-      `https://api.xero.com/api.xro/2.0/Invoices/${invoiceId}`,
-      { Invoices: [updated] },
-      { headers: xeroHeaders(token, tenantId) }
-    );
-    const result = r.data.Invoices?.[0];
-    res.json({
-      success: true,
-      invoiceId: result?.InvoiceID,
-      invoiceNumber: result?.InvoiceNumber,
-      status: result?.Status,
-      total: result?.Total,
-      contact: result?.Contact?.Name,
-      date: result?.Date,
-      dueDate: result?.DueDate,
-      reference: result?.Reference,
-    });
-  } catch (err) {
-    console.error('═══ UPDATE BILL ERROR ═══');
-    console.error('Status:', err.response?.status);
-    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
-    console.error('Message:', err.message);
-    console.error('═════════════════════════');
-    res.status(500).json({
-      error: err.response?.data?.Message || err.message,
-      xeroResponse: err.response?.data,
-      xeroStatus: err.response?.status,
-    });
+async function xeroAttachToSpendMoney(bankTransactionId, filename, buffer, mimeType) {
+  if (!bankTransactionId || !filename || !buffer) {
+    const err = new Error('bankTransactionId, filename, and buffer are required');
+    err.status = 400;
+    throw err;
   }
-});
+  const { token, tenantId } = await getValidToken();
+  const r = await axios.post(
+    `https://api.xero.com/api.xro/2.0/BankTransactions/${bankTransactionId}/Attachments/${encodeURIComponent(filename)}`,
+    buffer,
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'xero-tenant-id': tenantId,
+        'Content-Type': mimeType || 'application/pdf',
+        'Content-Length': buffer.length,
+      },
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+    }
+  );
+  return { success: true, bytesAttached: buffer.length, attachment: r.data.Attachments?.[0] };
+}
 
-// ─── Gmail helpers (server-side only) ────────────────────────────────────
-// Find Gmail label ID by display name (e.g. "Supplier invoices").
+// ──────────────────────────────────────────────────────────────────────────
+// Gmail handler functions
+// ──────────────────────────────────────────────────────────────────────────
+
 async function resolveGmailLabelId(labelName) {
   const token = await getValidGmailToken();
   const r = await axios.get(
@@ -716,11 +986,14 @@ async function resolveGmailLabelId(labelName) {
     { headers: gmailHeaders(token) }
   );
   const match = (r.data.labels || []).find(l => l.name === labelName);
-  if (!match) throw new Error(`Gmail label "${labelName}" not found`);
+  if (!match) {
+    const err = new Error(`Gmail label "${labelName}" not found (case-sensitive)`);
+    err.status = 404;
+    throw err;
+  }
   return match.id;
 }
 
-// Walk a Gmail message payload tree to collect attachments.
 function collectAttachments(payload, out = []) {
   if (!payload) return out;
   if (payload.filename && payload.body && payload.body.attachmentId) {
@@ -743,53 +1016,6 @@ function pickHeader(headers, name) {
   return h ? h.value : null;
 }
 
-// ─── Gmail API routes ────────────────────────────────────────────────────
-// List messages under a Gmail label, with attachment metadata. Designed so
-// Claude can ask "what's unprocessed in 'Supplier invoices'?" each Monday.
-app.get('/api/gmail-list-by-label', async (req, res) => {
-  const { label, maxResults } = req.query;
-  if (!label) return res.status(400).json({ error: 'label query param required (e.g. "Supplier invoices")' });
-  try {
-    const token = await getValidGmailToken();
-    const labelId = await resolveGmailLabelId(label);
-    const listRes = await axios.get(
-      `https://gmail.googleapis.com/gmail/v1/users/me/messages?labelIds=${encodeURIComponent(labelId)}&maxResults=${Number(maxResults) || 50}`,
-      { headers: gmailHeaders(token) }
-    );
-    const ids = (listRes.data.messages || []).map(m => m.id);
-    // Fetch each message in parallel — metadata format is lightweight.
-    const messages = await Promise.all(ids.map(async id => {
-      const m = await axios.get(
-        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`,
-        { headers: gmailHeaders(token) }
-      );
-      const p = m.data.payload || {};
-      const headers = p.headers || [];
-      return {
-        messageId: m.data.id,
-        threadId: m.data.threadId,
-        subject: pickHeader(headers, 'Subject'),
-        from: pickHeader(headers, 'From'),
-        to: pickHeader(headers, 'To'),
-        date: pickHeader(headers, 'Date'),
-        internalDate: m.data.internalDate,
-        snippet: m.data.snippet,
-        attachments: collectAttachments(p),
-      };
-    }));
-    res.json({ label, count: messages.length, messages });
-  } catch (err) {
-    console.error('═══ GMAIL LIST BY LABEL ERROR ═══');
-    console.error('Status:', err.response?.status);
-    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
-    console.error('Message:', err.message);
-    console.error('═════════════════════════════════');
-    res.status(500).json({ error: err.response?.data?.error?.message || err.message });
-  }
-});
-
-// Fetch the raw PDF bytes of a Gmail attachment, attach to a Xero bill.
-// Claude only passes small IDs — the heavy lifting happens server-side.
 async function fetchGmailAttachment(messageId, attachmentId) {
   const token = await getValidGmailToken();
   const r = await axios.get(
@@ -797,7 +1023,13 @@ async function fetchGmailAttachment(messageId, attachmentId) {
     { headers: gmailHeaders(token) }
   );
   if (!r.data.data) throw new Error('Gmail attachment returned empty data');
-  return base64urlDecode(r.data.data);
+  const buf = base64urlDecode(r.data.data);
+  if (buf.length > MAX_PDF_BYTES) {
+    const err = new Error(`Attachment is ${buf.length} bytes, exceeds MAX_PDF_BYTES=${MAX_PDF_BYTES}`);
+    err.status = 413;
+    throw err;
+  }
+  return buf;
 }
 
 async function fetchGmailRawMessage(messageId) {
@@ -810,32 +1042,6 @@ async function fetchGmailRawMessage(messageId) {
   return base64urlDecode(r.data.raw);
 }
 
-// Fetch a Gmail PDF attachment server-side and extract its text via pdf-parse.
-// Used to read Net/GST figures and line items from Moco, Big Michael's, CCA,
-// Stel, Norkatu invoice PDFs without passing bytes through the MCP connection.
-async function extractPdfTextFromGmail({ messageId, attachmentId, maxChars = 50000 }) {
-  if (!messageId || !attachmentId) {
-    throw new Error('messageId and attachmentId are required');
-  }
-  const buffer = await fetchGmailAttachment(messageId, attachmentId);
-  const parsed = await pdf(buffer);
-  const effectiveMax = Number(maxChars) > 0 ? Number(maxChars) : 50000;
-  const text = parsed.text.length > effectiveMax
-    ? parsed.text.slice(0, effectiveMax) + '\n[...truncated]'
-    : parsed.text;
-  return {
-    messageId,
-    attachmentId,
-    pageCount: parsed.numpages,
-    bytes: buffer.length,
-    charsReturned: text.length,
-    text,
-  };
-}
-
-// Fetch a full Gmail message (headers + payload tree). Used by
-// extractEmailBodyFromGmail to walk MIME parts. Uses format=full rather than
-// format=raw so the API pre-parses the MIME structure for us.
 async function fetchGmailFullMessage(messageId) {
   const token = await getValidGmailToken();
   const r = await axios.get(
@@ -846,20 +1052,98 @@ async function fetchGmailFullMessage(messageId) {
   return r.data;
 }
 
-// Minimal HTML-to-text conversion for email bodies. Sufficient for parsing
-// supplier invoice emails (CCA, etc.) where we just need the readable text.
-// Not a general-purpose HTML parser — don't feed it arbitrary web pages.
+async function gmailListByLabel({ label, maxResults }) {
+  if (!label) {
+    const err = new Error('label is required');
+    err.status = 400;
+    throw err;
+  }
+  const token = await getValidGmailToken();
+  const labelId = await resolveGmailLabelId(label);
+  const limit = Math.min(Number(maxResults) || 50, 500);
+  const listRes = await axios.get(
+    `https://gmail.googleapis.com/gmail/v1/users/me/messages?labelIds=${encodeURIComponent(labelId)}&maxResults=${limit}`,
+    { headers: gmailHeaders(token) }
+  );
+  const ids = (listRes.data.messages || []).map(m => m.id);
+
+  // Bounded concurrency. The original used Promise.all(ids.map()) which
+  // (a) flooded Gmail's per-user rate limit, and (b) failed the whole batch
+  // on a single message error. allSettled-style results lets us return
+  // partials and tell the caller about failures.
+  const fetched = await mapWithConcurrency(ids, 5, async (id) => {
+    const m = await axios.get(
+      `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`,
+      { headers: gmailHeaders(token) }
+    );
+    const p = m.data.payload || {};
+    const headers = p.headers || [];
+    return {
+      messageId: m.data.id,
+      threadId: m.data.threadId,
+      subject: pickHeader(headers, 'Subject'),
+      from: pickHeader(headers, 'From'),
+      to: pickHeader(headers, 'To'),
+      date: pickHeader(headers, 'Date'),
+      internalDate: m.data.internalDate,
+      snippet: m.data.snippet,
+      attachments: collectAttachments(p),
+    };
+  });
+
+  const messages = [];
+  const failures = [];
+  fetched.forEach((entry, i) => {
+    if (entry.status === 'fulfilled') messages.push(entry.value);
+    else failures.push({ messageId: ids[i], error: entry.reason?.message || String(entry.reason) });
+  });
+
+  return { label, count: messages.length, requestedCount: ids.length, failures, messages };
+}
+
+// PDF text extraction. Bounded by MAX_PDF_BYTES via fetchGmailAttachment.
+async function extractPdfTextFromGmail({ messageId, attachmentId, maxChars = 50000 }) {
+  if (!messageId || !attachmentId) {
+    const err = new Error('messageId and attachmentId are required');
+    err.status = 400;
+    throw err;
+  }
+  const buffer = await fetchGmailAttachment(messageId, attachmentId);
+  let parsed;
+  try {
+    parsed = await pdf(buffer);
+  } catch (e) {
+    const err = new Error(`pdf-parse failed: ${e.message}. PDF may be image-only or corrupt.`);
+    err.status = 422;
+    throw err;
+  }
+  const effectiveMax = Number(maxChars) > 0 ? Number(maxChars) : 50000;
+  const text = truncateText(parsed.text || '', effectiveMax);
+  return {
+    messageId,
+    attachmentId,
+    pageCount: parsed.numpages,
+    bytes: buffer.length,
+    charsReturned: text.length,
+    text,
+    warning: !parsed.text || parsed.text.trim().length === 0
+      ? 'No text extracted — PDF is likely image-only/scanned. OCR required.'
+      : null,
+  };
+}
+
+// Minimal HTML→text. Not a general parser — only feed it supplier email bodies.
 function stripHtml(html) {
   return html
-    // Remove script/style blocks entirely
     .replace(/<script[\s\S]*?<\/script>/gi, '')
     .replace(/<style[\s\S]*?<\/style>/gi, '')
-    // Inject newlines for block-level elements so text doesn't mash together
     .replace(/<\/(p|div|li|h[1-6]|tr|table)>/gi, '\n')
+    // Cell separators — important for CCA invoices where line-item rows are
+    // table rows. Without this, cell contents mash together.
+    .replace(/<\/(td|th)>/gi, '\t')
     .replace(/<br\s*\/?>/gi, '\n')
-    // Strip remaining tags
     .replace(/<[^>]+>/g, '')
-    // Decode common named HTML entities
+    // Named entities
     .replace(/&nbsp;/gi, ' ')
     .replace(/&amp;/gi, '&')
     .replace(/&lt;/gi, '<')
@@ -868,28 +1152,34 @@ function stripHtml(html) {
     .replace(/&#39;/gi, "'")
     .replace(/&apos;/gi, "'")
     .replace(/&hellip;/gi, '…')
-    // Decode numeric HTML entities (decimal and hex)
+    .replace(/&copy;/gi, '©')
+    .replace(/&reg;/gi, '®')
+    .replace(/&trade;/gi, '™')
+    .replace(/&mdash;/gi, '—')
+    .replace(/&ndash;/gi, '–')
+    // Numeric entities
     .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
     .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCharCode(parseInt(h, 16)))
-    // Collapse whitespace without destroying intentional line breaks
+    // Whitespace cleanup
     .replace(/[ \t]+/g, ' ')
     .replace(/\n[ \t]+/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
 
-// Fetch a Gmail message server-side and return its body text. Prefers
-// text/plain MIME parts; falls back to stripping HTML from text/html if plain
-// text is absent. Used for supplier invoices where data lives in the email
-// body rather than a PDF attachment (e.g. Coca-Cola CCEP Non-Stock Invoice).
-// Decodes all parts as UTF-8 — if a supplier sends in a different charset,
-// mojibake is the failure mode and we'd need charset-aware decoding.
-async function extractEmailBodyFromGmail({ messageId, maxChars = 50000 }) {
-  if (!messageId) throw new Error('messageId is required');
-
+// Email body extraction. Returns BOTH plain and stripped-html when available;
+// caller picks via `prefer` parameter ('plain' | 'html' | 'auto').
+// 'auto' default: plain if it has reasonable length, else html.
+// Fixes the "CCA plain-text drops table rows" failure mode by exposing both
+// representations to the caller.
+async function extractEmailBodyFromGmail({ messageId, maxChars = 50000, prefer = 'auto' }) {
+  if (!messageId) {
+    const err = new Error('messageId is required');
+    err.status = 400;
+    throw err;
+  }
   const message = await fetchGmailFullMessage(messageId);
 
-  // Walk the MIME tree, collecting text/plain and text/html leaf parts.
   const collected = { plain: [], html: [] };
   function walk(part) {
     if (!part) return;
@@ -898,223 +1188,389 @@ async function extractEmailBodyFromGmail({ messageId, maxChars = 50000 }) {
     } else if (part.mimeType === 'text/html' && part.body?.data) {
       collected.html.push(base64urlDecode(part.body.data).toString('utf8'));
     }
-    if (Array.isArray(part.parts)) {
-      for (const child of part.parts) walk(child);
-    }
+    if (Array.isArray(part.parts)) part.parts.forEach(walk);
   }
   walk(message.payload);
 
-  let bodySource = 'plain';
-  let body = collected.plain.join('\n\n').trim();
-  if (!body && collected.html.length > 0) {
-    bodySource = 'html';
-    body = stripHtml(collected.html.join('\n\n')).trim();
+  const plainBody = collected.plain.join('\n\n').trim();
+  const htmlBody = collected.html.length ? stripHtml(collected.html.join('\n\n')).trim() : '';
+
+  let chosenSource, chosen;
+  if (prefer === 'plain') {
+    chosenSource = plainBody ? 'plain' : (htmlBody ? 'html' : null);
+    chosen = plainBody || htmlBody;
+  } else if (prefer === 'html') {
+    chosenSource = htmlBody ? 'html' : (plainBody ? 'plain' : null);
+    chosen = htmlBody || plainBody;
+  } else {
+    // auto: prefer HTML if it's >= 1.2x the plain length (suggests plain is dropping content)
+    if (htmlBody && (!plainBody || htmlBody.length >= plainBody.length * 1.2)) {
+      chosenSource = 'html';
+      chosen = htmlBody;
+    } else {
+      chosenSource = plainBody ? 'plain' : (htmlBody ? 'html' : null);
+      chosen = plainBody || htmlBody;
+    }
   }
-  if (!body) bodySource = null; // no text body found
+  chosen = chosen || '';
 
-  // Surface useful headers so the caller doesn't need a separate metadata call.
   const headers = message.payload?.headers || [];
-  const getHeader = name =>
-    headers.find(h => h.name?.toLowerCase() === name.toLowerCase())?.value || null;
-
-  const effectiveMax = Number(maxChars) > 0 ? Number(maxChars) : 50000;
-  const text = body.length > effectiveMax
-    ? body.slice(0, effectiveMax) + '\n[...truncated]'
-    : body;
 
   return {
     messageId,
-    subject: getHeader('Subject'),
-    from: getHeader('From'),
-    date: getHeader('Date'),
-    bodySource, // 'plain' | 'html' | null
-    charsReturned: text.length,
-    text,
+    subject: pickHeader(headers, 'Subject'),
+    from: pickHeader(headers, 'From'),
+    date: pickHeader(headers, 'Date'),
+    bodySource: chosenSource,
+    hasPlain: plainBody.length > 0,
+    hasHtml: htmlBody.length > 0,
+    plainCharCount: plainBody.length,
+    htmlCharCount: htmlBody.length,
+    charsReturned: Math.min(chosen.length, Number(maxChars) > 0 ? Number(maxChars) : 50000),
+    text: truncateText(chosen, Number(maxChars) > 0 ? Number(maxChars) : 50000),
   };
 }
 
-app.post('/api/xero-attach-gmail-pdf-to-bill', async (req, res) => {
-  console.log('═══ ATTACH GMAIL PDF TO BILL ═══');
-  console.log(JSON.stringify(req.body, null, 2));
+// ──────────────────────────────────────────────────────────────────────────
+// Atomic create-and-attach (Gmail-pipeline path) — addresses the orphan
+// problem where create succeeds but attach fails. If attach fails, the
+// just-created Xero record is voided/deleted, returning the caller to the
+// pre-create state.
+// ──────────────────────────────────────────────────────────────────────────
+
+async function createBillWithGmailAttachment(input) {
+  const created = await xeroCreateBill(input.bill);
+  try {
+    const buffer = input.useEml
+      ? await fetchGmailRawMessage(input.gmailMessageId)
+      : await fetchGmailAttachment(input.gmailMessageId, input.gmailAttachmentId);
+    const filename = input.filename || (input.useEml
+      ? `email-${input.gmailMessageId}.eml`
+      : `attachment-${input.gmailAttachmentId}.pdf`);
+    const mimeType = input.useEml ? 'message/rfc822' : (input.mimeType || 'application/pdf');
+    const attached = await xeroAttachToInvoice(created.invoiceId, filename, buffer, mimeType);
+    return { ...created, attachment: attached };
+  } catch (attachErr) {
+    // Roll back the bill so we don't leave an unattached orphan.
+    let rollback;
+    try { rollback = await xeroVoidBill(created.invoiceId); }
+    catch (rollbackErr) { rollback = { error: rollbackErr.message }; }
+    const err = new Error(`Bill created (${created.invoiceId}) but attach failed: ${attachErr.message}. Rollback: ${JSON.stringify(rollback)}`);
+    err.status = 502;
+    err.createdInvoiceId = created.invoiceId;
+    err.rollback = rollback;
+    throw err;
+  }
+}
+
+async function createSpendMoneyWithGmailAttachment(input) {
+  const created = await xeroCreateSpendMoney(input.spend);
+  try {
+    const buffer = input.useEml
+      ? await fetchGmailRawMessage(input.gmailMessageId)
+      : await fetchGmailAttachment(input.gmailMessageId, input.gmailAttachmentId);
+    const filename = input.filename || (input.useEml
+      ? `email-${input.gmailMessageId}.eml`
+      : `attachment-${input.gmailAttachmentId}.pdf`);
+    const mimeType = input.useEml ? 'message/rfc822' : (input.mimeType || 'application/pdf');
+    const attached = await xeroAttachToSpendMoney(created.bankTransactionId, filename, buffer, mimeType);
+    return { ...created, attachment: attached };
+  } catch (attachErr) {
+    let rollback;
+    try { rollback = await xeroDeleteSpendMoney(created.bankTransactionId); }
+    catch (rollbackErr) { rollback = { error: rollbackErr.message }; }
+    const err = new Error(`Spend Money created (${created.bankTransactionId}) but attach failed: ${attachErr.message}. Rollback: ${JSON.stringify(rollback)}`);
+    err.status = 502;
+    err.createdBankTransactionId = created.bankTransactionId;
+    err.rollback = rollback;
+    throw err;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Express routes — thin wrappers around the handler functions
+// ──────────────────────────────────────────────────────────────────────────
+
+// /api/debug — reveals enough about the configuration to be useful for
+// debugging but is auth-protected. Was previously open.
+app.get('/api/debug', requireBearer, (req, res) => {
+  res.json({
+    clientIdLength: (process.env.XERO_CLIENT_ID || '').length,
+    clientIdStart: (process.env.XERO_CLIENT_ID || '').slice(0, 4),
+    redirectUri: process.env.XERO_REDIRECT_URI,
+    hasSecret: !!process.env.XERO_CLIENT_SECRET,
+    hasStoredRefreshToken: !!xeroStore.refreshToken,
+    tenantId: xeroStore.tenantId,
+    tokenStorePath: TOKEN_STORE_PATH,
+    tokenStoreExists: fs.existsSync(TOKEN_STORE_PATH),
+    gmail: {
+      clientIdConfigured: !!process.env.GMAIL_CLIENT_ID,
+      clientSecretConfigured: !!process.env.GMAIL_CLIENT_SECRET,
+      redirectUri: process.env.GMAIL_REDIRECT_URI || null,
+      hasStoredRefreshToken: !!gmailStore.refreshToken,
+    },
+    activeMcpSessions: mcpSessions.size,
+  });
+});
+
+// Health check — public, no auth, returns minimal info.
+app.get('/healthz', (req, res) => res.json({ ok: true, time: Date.now() }));
+
+// Web app route — kept for backwards compat with the React dashboard.
+// Now requires the same shared secret as the MCP routes.
+app.get('/api/xero-labour', requireBearer, asyncRoute(async (req, res) => {
+  const { fromDate, toDate } = req.query;
+  if (!fromDate || !toDate) {
+    return res.status(400).json({ error: 'fromDate and toDate required' });
+  }
+  const { token, tenantId } = await getValidToken();
+  const LABOUR_KEYWORDS = ['wage', 'labour', 'labor', 'payroll', 'salary', 'salaries', 'superannuation', 'super'];
+  const plRes = await axios.get(
+    `https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?fromDate=${encodeURIComponent(fromDate)}&toDate=${encodeURIComponent(toDate)}&standardLayout=true`,
+    { headers: xeroHeaders(token, tenantId) }
+  );
+  const rows = plRes.data?.Reports?.[0]?.Rows || [];
+  let labourExGST = 0;
+  const walk = rows => {
+    for (const row of rows) {
+      if (row.Rows) walk(row.Rows);
+      if (row.Cells) {
+        const name = (row.Cells[0]?.Value || '').toLowerCase();
+        const amt = parseFloat(row.Cells[1]?.Value) || 0;
+        if (LABOUR_KEYWORDS.some(k => name.includes(k))) labourExGST += Math.abs(amt);
+      }
+    }
+  };
+  walk(rows);
+  res.json({ labourExGST: parseFloat(labourExGST.toFixed(2)) });
+}));
+
+app.post('/api/parse-invoice', requireBearer, asyncRoute(async (req, res) => {
+  const { base64, filename } = req.body;
+  if (!base64) return res.status(400).json({ error: 'No file data' });
+
+  // Supplier→category lookup. Keys are lowercased substrings of the supplier
+  // name as returned by the parser. Original code had "big michaels" (no
+  // apostrophe) which never matched "Big Michael's Fruit and Vegetables".
+  const SUPPLIER_CATS = [
+    [/stel/, 'coffee'],
+    [/norkatu/, 'coffee'],
+    [/moco/, 'food'],
+    [/fresho/, 'food'],
+    [/big\s*michael/, 'food'],     // matches "Big Michael's"
+    [/coca[\s-]*cola|ccep|cca\b/, 'food'],
+    [/ordermentum/, 'food'],
+    [/carbar/, 'vehicle'],
+  ];
+  const categFromSupplier = name => {
+    const l = (name || '').toLowerCase();
+    for (const [re, cat] of SUPPLIER_CATS) if (re.test(l)) return cat;
+    return null;
+  };
+
+  const response = await axios.post(
+    'https://api.anthropic.com/v1/messages',
+    {
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1000,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } },
+          { type: 'text', text: 'Extract from this invoice and respond ONLY with valid JSON, no markdown:\n{"supplier":"<name>","invoice_number":"<inv#>","invoice_date":"<date>","total_inc_gst":<number>,"total_ex_gst":<number>,"gst_amount":<number>}\nUse null for missing fields.' },
+        ],
+      }],
+    },
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+    }
+  );
+  const text = response.data.content?.map(b => b.text || '').join('') || '{}';
+  let parsed;
+  try { parsed = JSON.parse(text.replace(/```json|```/g, '').trim()); }
+  catch (e) { return res.status(502).json({ error: 'Parser returned non-JSON', raw: text }); }
+  res.json({ ...parsed, category: categFromSupplier(parsed.supplier), file: filename });
+}));
+
+app.post('/api/generate-report', requireBearer, asyncRoute(async (req, res) => {
+  const { weekLabel, coffeeEx, foodEx, total, cogsCoEx, cogsFdEx, gp, gpPct, labourEx, labourPct, txns, avg } = req.body;
+  const fmt = n => `$${Number(n).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const pct = (a, b) => b === 0 ? '—' : `${((a / b) * 100).toFixed(1)}%`;
+  const prompt = `You are a financial analyst for a café. Generate a concise weekly report.
+Week: ${weekLabel || 'This week'}
+Turnover Coffee: ${fmt(coffeeEx)}, Food & Bev: ${fmt(foodEx)}, Total: ${fmt(total)}
+COGS Coffee: ${fmt(cogsCoEx)} (${pct(cogsCoEx, coffeeEx)}), Food: ${fmt(cogsFdEx)} (${pct(cogsFdEx, foodEx)})
+Labour: ${fmt(labourEx)} (${Number(labourPct).toFixed(1)}% of turnover)
+Gross Profit: ${fmt(gp)} (${Number(gpPct).toFixed(1)}%), Transactions: ${Number(txns).toLocaleString()}, Avg Spend: ${fmt(avg)}
+Provide: 1) 2-sentence executive summary 2) Key highlights 3) Watch points (flag labour >35% or high COGS) 4) 2-3 recommendations. Use **bold** for section labels.`;
+  const response = await axios.post(
+    'https://api.anthropic.com/v1/messages',
+    { model: 'claude-sonnet-4-20250514', max_tokens: 1000, messages: [{ role: 'user', content: prompt }] },
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+    }
+  );
+  res.json({ report: response.data.content?.map(b => b.text || '').join('') || '' });
+}));
+
+app.get('/api/xero-check-invoice', requireBearer, asyncRoute(async (req, res) => {
+  logSection('CHECK INVOICE', { invoiceNumber: req.query.invoiceNumber });
+  const result = await xeroCheckInvoice(req.query.invoiceNumber);
+  res.json(result);
+}));
+
+app.get('/api/xero-search-spend-money', requireBearer, asyncRoute(async (req, res) => {
+  logSection('SEARCH SPEND MONEY', req.query);
+  const result = await xeroSearchSpendMoney({
+    reference: req.query.reference,
+    contactName: req.query.contactName,
+    amount: req.query.amount,
+    fromDate: req.query.fromDate,
+    toDate: req.query.toDate,
+    bankAccountCode: req.query.bankAccountCode,
+  });
+  res.json(result);
+}));
+
+app.post('/api/xero-create-bill', requireBearer, asyncRoute(async (req, res) => {
+  logSection('CREATE BILL', req.body);
+  const result = await xeroCreateBill(req.body);
+  res.json(result);
+}));
+
+app.post('/api/xero-update-bill', requireBearer, asyncRoute(async (req, res) => {
+  logSection('UPDATE BILL', req.body);
+  const result = await xeroUpdateBill(req.body);
+  res.json(result);
+}));
+
+app.get('/api/xero-open-bills', requireBearer, asyncRoute(async (req, res) => {
+  const result = await xeroGetOpenBills(req.query);
+  res.json(result);
+}));
+
+app.post('/api/xero-create-spend-money', requireBearer, asyncRoute(async (req, res) => {
+  logSection('CREATE SPEND MONEY', req.body);
+  const result = await xeroCreateSpendMoney(req.body);
+  res.json(result);
+}));
+
+app.post('/api/xero-attach-receipt', requireBearer, asyncRoute(async (req, res) => {
+  const { billId, filename, base64Content, mimeType } = req.body;
+  if (!billId || !filename || !base64Content) {
+    return res.status(400).json({ error: 'billId, filename, and base64Content are required' });
+  }
+  const buffer = Buffer.from(base64Content, 'base64');
+  if (buffer.length > MAX_PDF_BYTES) {
+    return res.status(413).json({ error: `Decoded buffer ${buffer.length} bytes exceeds MAX_PDF_BYTES=${MAX_PDF_BYTES}` });
+  }
+  const result = await xeroAttachToInvoice(billId, filename, buffer, mimeType);
+  res.json(result);
+}));
+
+app.post('/api/xero-attach-receipt-spend-money', requireBearer, asyncRoute(async (req, res) => {
+  const { bankTransactionId, filename, base64Content, mimeType } = req.body;
+  if (!bankTransactionId || !filename || !base64Content) {
+    return res.status(400).json({ error: 'bankTransactionId, filename, and base64Content are required' });
+  }
+  const buffer = Buffer.from(base64Content, 'base64');
+  if (buffer.length > MAX_PDF_BYTES) {
+    return res.status(413).json({ error: `Decoded buffer ${buffer.length} bytes exceeds MAX_PDF_BYTES=${MAX_PDF_BYTES}` });
+  }
+  const result = await xeroAttachToSpendMoney(bankTransactionId, filename, buffer, mimeType);
+  res.json(result);
+}));
+
+app.get('/api/gmail-list-by-label', requireBearer, asyncRoute(async (req, res) => {
+  const result = await gmailListByLabel({ label: req.query.label, maxResults: req.query.maxResults });
+  res.json(result);
+}));
+
+app.post('/api/extract-pdf-text', requireBearer, asyncRoute(async (req, res) => {
+  const result = await extractPdfTextFromGmail(req.body);
+  res.json(result);
+}));
+
+app.post('/api/extract-email-body', requireBearer, asyncRoute(async (req, res) => {
+  const result = await extractEmailBodyFromGmail(req.body);
+  res.json(result);
+}));
+
+app.post('/api/xero-attach-gmail-pdf-to-bill', requireBearer, asyncRoute(async (req, res) => {
+  logSection('ATTACH GMAIL PDF TO BILL', req.body);
   const { billId, gmailMessageId, gmailAttachmentId, filename, mimeType } = req.body;
   if (!billId || !gmailMessageId || !gmailAttachmentId || !filename) {
     return res.status(400).json({ error: 'billId, gmailMessageId, gmailAttachmentId, filename are required' });
   }
-  try {
-    const buffer = await fetchGmailAttachment(gmailMessageId, gmailAttachmentId);
-    const { token, tenantId } = await getValidToken();
-    const r = await axios.post(
-      `https://api.xero.com/api.xro/2.0/Invoices/${billId}/Attachments/${encodeURIComponent(filename)}`,
-      buffer,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'xero-tenant-id': tenantId,
-          'Content-Type': mimeType || 'application/pdf',
-          'Content-Length': buffer.length,
-        },
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity,
-      }
-    );
-    res.json({ success: true, bytesAttached: buffer.length, attachment: r.data.Attachments?.[0] });
-  } catch (err) {
-    console.error('Status:', err.response?.status);
-    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
-    console.error('Message:', err.message);
-    res.status(500).json({ error: err.response?.data?.Message || err.response?.data?.error?.message || err.message });
-  }
-});
+  const buffer = await fetchGmailAttachment(gmailMessageId, gmailAttachmentId);
+  const result = await xeroAttachToInvoice(billId, filename, buffer, mimeType);
+  res.json(result);
+}));
 
-app.post('/api/xero-attach-gmail-pdf-to-spend-money', async (req, res) => {
-  console.log('═══ ATTACH GMAIL PDF TO SPEND MONEY ═══');
-  console.log(JSON.stringify(req.body, null, 2));
+app.post('/api/xero-attach-gmail-pdf-to-spend-money', requireBearer, asyncRoute(async (req, res) => {
+  logSection('ATTACH GMAIL PDF TO SPEND MONEY', req.body);
   const { bankTransactionId, gmailMessageId, gmailAttachmentId, filename, mimeType } = req.body;
   if (!bankTransactionId || !gmailMessageId || !gmailAttachmentId || !filename) {
     return res.status(400).json({ error: 'bankTransactionId, gmailMessageId, gmailAttachmentId, filename are required' });
   }
-  try {
-    const buffer = await fetchGmailAttachment(gmailMessageId, gmailAttachmentId);
-    const { token, tenantId } = await getValidToken();
-    const r = await axios.post(
-      `https://api.xero.com/api.xro/2.0/BankTransactions/${bankTransactionId}/Attachments/${encodeURIComponent(filename)}`,
-      buffer,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'xero-tenant-id': tenantId,
-          'Content-Type': mimeType || 'application/pdf',
-          'Content-Length': buffer.length,
-        },
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity,
-      }
-    );
-    res.json({ success: true, bytesAttached: buffer.length, attachment: r.data.Attachments?.[0] });
-  } catch (err) {
-    console.error('Status:', err.response?.status);
-    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
-    console.error('Message:', err.message);
-    res.status(500).json({ error: err.response?.data?.Message || err.response?.data?.error?.message || err.message });
-  }
-});
+  const buffer = await fetchGmailAttachment(gmailMessageId, gmailAttachmentId);
+  const result = await xeroAttachToSpendMoney(bankTransactionId, filename, buffer, mimeType);
+  res.json(result);
+}));
 
-// Stel (and any other email-only supplier) has no PDF — the email body IS
-// the invoice. Attach the raw message as .eml instead.
-app.post('/api/xero-attach-gmail-email-to-bill', async (req, res) => {
-  console.log('═══ ATTACH GMAIL EMAIL TO BILL ═══');
-  console.log(JSON.stringify(req.body, null, 2));
+app.post('/api/xero-attach-gmail-email-to-bill', requireBearer, asyncRoute(async (req, res) => {
+  logSection('ATTACH GMAIL EMAIL TO BILL', req.body);
   const { billId, gmailMessageId, filename } = req.body;
   if (!billId || !gmailMessageId) {
     return res.status(400).json({ error: 'billId and gmailMessageId are required' });
   }
-  try {
-    const buffer = await fetchGmailRawMessage(gmailMessageId);
-    const { token, tenantId } = await getValidToken();
-    const name = filename || `email-${gmailMessageId}.eml`;
-    const r = await axios.post(
-      `https://api.xero.com/api.xro/2.0/Invoices/${billId}/Attachments/${encodeURIComponent(name)}`,
-      buffer,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'xero-tenant-id': tenantId,
-          'Content-Type': 'message/rfc822',
-          'Content-Length': buffer.length,
-        },
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity,
-      }
-    );
-    res.json({ success: true, bytesAttached: buffer.length, attachment: r.data.Attachments?.[0] });
-  } catch (err) {
-    console.error('Status:', err.response?.status);
-    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
-    console.error('Message:', err.message);
-    res.status(500).json({ error: err.response?.data?.Message || err.response?.data?.error?.message || err.message });
-  }
-});
+  const buffer = await fetchGmailRawMessage(gmailMessageId);
+  const name = filename || `email-${gmailMessageId}.eml`;
+  const result = await xeroAttachToInvoice(billId, name, buffer, 'message/rfc822');
+  res.json(result);
+}));
 
-app.post('/api/xero-attach-gmail-email-to-spend-money', async (req, res) => {
-  console.log('═══ ATTACH GMAIL EMAIL TO SPEND MONEY ═══');
-  console.log(JSON.stringify(req.body, null, 2));
+app.post('/api/xero-attach-gmail-email-to-spend-money', requireBearer, asyncRoute(async (req, res) => {
+  logSection('ATTACH GMAIL EMAIL TO SPEND MONEY', req.body);
   const { bankTransactionId, gmailMessageId, filename } = req.body;
   if (!bankTransactionId || !gmailMessageId) {
     return res.status(400).json({ error: 'bankTransactionId and gmailMessageId are required' });
   }
-  try {
-    const buffer = await fetchGmailRawMessage(gmailMessageId);
-    const { token, tenantId } = await getValidToken();
-    const name = filename || `email-${gmailMessageId}.eml`;
-    const r = await axios.post(
-      `https://api.xero.com/api.xro/2.0/BankTransactions/${bankTransactionId}/Attachments/${encodeURIComponent(name)}`,
-      buffer,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'xero-tenant-id': tenantId,
-          'Content-Type': 'message/rfc822',
-          'Content-Length': buffer.length,
-        },
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity,
-      }
-    );
-    res.json({ success: true, bytesAttached: buffer.length, attachment: r.data.Attachments?.[0] });
-  } catch (err) {
-    console.error('Status:', err.response?.status);
-    console.error('Data:', JSON.stringify(err.response?.data, null, 2));
-    console.error('Message:', err.message);
-    res.status(500).json({ error: err.response?.data?.Message || err.response?.data?.error?.message || err.message });
-  }
-});
+  const buffer = await fetchGmailRawMessage(gmailMessageId);
+  const name = filename || `email-${gmailMessageId}.eml`;
+  const result = await xeroAttachToSpendMoney(bankTransactionId, name, buffer, 'message/rfc822');
+  res.json(result);
+}));
+
+// ──────────────────────────────────────────────────────────────────────────
+// MCP tool definitions
+// ──────────────────────────────────────────────────────────────────────────
 
 const MCP_TOOLS = [
-  { name: 'check_duplicate_invoice', description: 'Check if an invoice number already exists in Xero — searches BOTH purchase bills (ACCPAY) AND Spend Money bank transactions (by Reference field). ALWAYS call this before creating a bill. Returns { existsAsBill, existsAsSpendMoney, bill, spendMoney, ... }. Stel Coffee sends overdue reminder emails so this check is critical. Note: Spend Money match depends on the invoice number being stored in the Reference field — for legacy entries that may not have a reference, use search_spend_money with contactName + amount as a cross-check.', inputSchema: { type: 'object', properties: { invoice_number: { type: 'string' } }, required: ['invoice_number'] } },
-  { name: 'create_xero_bill', description: 'Create a purchase bill in Xero as AUTHORISED. Only call after confirming no duplicate with check_duplicate_invoice.', inputSchema: { type: 'object', properties: { supplier_name: { type: 'string' }, invoice_number: { type: 'string' }, invoice_date: { type: 'string', description: 'YYYY-MM-DD' }, due_date: { type: 'string', description: 'YYYY-MM-DD, default net 30' }, line_items: { type: 'array', items: { type: 'object', properties: { description: { type: 'string' }, quantity: { type: 'number', default: 1 }, unit_amount: { type: 'number', description: 'EX-GST amount' }, account_code: { type: 'string', description: 'Coffee/milk=700, Food&Bev=701, General=429' }, tax_type: { type: 'string', default: 'INPUT' } }, required: ['description', 'unit_amount', 'account_code'] } } }, required: ['supplier_name', 'invoice_number', 'invoice_date', 'line_items'] } },
   {
-    name: 'update_xero_bill',
-    description: 'Update an existing purchase bill (ACCPAY) in Xero. Use when a bill needs its contact, dates, reference, or status changed after creation — e.g. when a supplier contact has been renamed, a due date was wrong, or to move a DRAFT to AUTHORISED. Does NOT update line items (delete and recreate instead for line item changes). Only fields provided are modified; other fields remain untouched. At least one updatable field must be provided.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        invoice_id: { type: 'string', description: 'The Xero InvoiceID (UUID) of the bill to update. Obtainable from create_xero_bill responses or check_duplicate_invoice.' },
-        supplier_name: { type: 'string', description: 'Optional — change the contact on the bill. Supplier must already exist in Xero contacts (search is by first match).' },
-        invoice_date: { type: 'string', description: 'Optional — new invoice Date in YYYY-MM-DD format.' },
-        due_date: { type: 'string', description: 'Optional — new DueDate in YYYY-MM-DD format.' },
-        reference: { type: 'string', description: 'Optional — set or change the Reference field. Pass empty string "" to clear.' },
-        status: { type: 'string', description: 'Optional — change status. Valid transitions: DRAFT → SUBMITTED → AUTHORISED, or DELETED to void a draft.' },
-      },
-      required: ['invoice_id'],
-    },
-  },
-  { name: 'attach_receipt_to_bill', description: 'Attach a PDF receipt to an existing Xero bill', inputSchema: { type: 'object', properties: { bill_id: { type: 'string' }, filename: { type: 'string' }, base64_content: { type: 'string' }, mime_type: { type: 'string', default: 'application/pdf' } }, required: ['bill_id', 'filename', 'base64_content'] } },
-  { name: 'get_open_bills', description: 'Get draft and authorised bills from Xero for reconciliation matching.', inputSchema: { type: 'object', properties: { from_date: { type: 'string' }, to_date: { type: 'string' } } } },
-  {
-    name: 'search_spend_money',
-    description: 'Search existing Spend Money (SPEND) bank transactions in Xero by any combination of reference, contact name, amount, and date range. Use this to catch duplicates for invoices that were previously entered as Spend Money rather than bills — especially legacy entries where the invoice number may not be in the Reference field (in which case, match on contact_name + amount + date range). At least one filter is required.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        reference: { type: 'string', description: 'Substring to match against the Reference field (case-sensitive). E.g. invoice number.' },
-        contact_name: { type: 'string', description: 'Substring to match against the Contact name. E.g. "Stel Coffee", "Norkatu".' },
-        amount: { type: 'number', description: 'Exact transaction total (inc GST) to match, ±$0.01.' },
-        from_date: { type: 'string', description: 'YYYY-MM-DD, inclusive' },
-        to_date: { type: 'string', description: 'YYYY-MM-DD, inclusive' },
-        bank_account_code: { type: 'string', description: 'Optional — filter by bank account code e.g. 605.' },
-      },
-    },
+    name: 'check_duplicate_invoice',
+    description: 'Check if an invoice number already exists in Xero — searches BOTH purchase bills (ACCPAY) AND Spend Money bank transactions. Uses word-boundary matching on the Reference field, so "INV-1234" will not false-match "INV-12345". ALWAYS call this before creating a bill or Spend Money. Returns { existsAsBill, existsAsSpendMoney, bill, spendMoney, ... }.',
+    inputSchema: { type: 'object', properties: { invoice_number: { type: 'string' } }, required: ['invoice_number'] },
   },
   {
-    name: 'create_spend_money',
-    description: 'Create an AUTHORISED Spend Money transaction in Xero for purchases already paid by card/bank. Use for receipt photos (Bunnings, Woolworths, fuel etc). Defaults to bank account code 605 (Business Trans Acct).',
+    name: 'create_xero_bill',
+    description: 'Create a purchase bill in Xero. Defaults to DRAFT status (per workflow doc). Pass status:"AUTHORISED" only if you really want to skip the review step. Only call after confirming no duplicate with check_duplicate_invoice. Sends an Idempotency-Key derived from supplier+invoice_number, so retries within 24h won\'t double-create.',
     inputSchema: {
       type: 'object',
       properties: {
-        payee_name: { type: 'string', description: 'Merchant name from receipt. Auto-created as contact if not existing.' },
-        transaction_date: { type: 'string', description: 'YYYY-MM-DD' },
-        reference: { type: 'string', description: 'Optional reference, e.g. receipt number' },
-        bank_account_code: { type: 'string', description: 'Bank account code. Default 605. Others: 602 Tyro, 603 Cash Float, 778 Petty Cash.', default: '605' },
+        supplier_name: { type: 'string' },
+        invoice_number: { type: 'string' },
+        invoice_date: { type: 'string', description: 'YYYY-MM-DD' },
+        due_date: { type: 'string', description: 'YYYY-MM-DD' },
+        status: { type: 'string', description: 'DRAFT (default), SUBMITTED, or AUTHORISED' },
         line_items: {
           type: 'array',
           items: {
@@ -1123,7 +1579,85 @@ const MCP_TOOLS = [
               description: { type: 'string' },
               quantity: { type: 'number', default: 1 },
               unit_amount: { type: 'number', description: 'EX-GST amount' },
-              account_code: { type: 'string', description: 'Bunnings/Officeworks=429, Woolworths/Coles=702, liquor=701, fuel=999, uniforms=508, cleaning=408, repairs=473, cafes=470' },
+              account_code: { type: 'string', description: 'Coffee/milk=700, Food&Bev=701, General=429' },
+              tax_type: { type: 'string', default: 'INPUT' },
+            },
+            required: ['description', 'unit_amount', 'account_code'],
+          },
+        },
+      },
+      required: ['supplier_name', 'invoice_number', 'invoice_date', 'line_items'],
+    },
+  },
+  {
+    name: 'update_xero_bill',
+    description: 'Update fields on an existing purchase bill (ACCPAY): contact, dates, reference, status. Does NOT update line items. Returns a contactChangeWarning if Xero silently rejected a contact change (common on AUTHORISED bills). Pass reference:"" or reference:null to clear the field.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        invoice_id: { type: 'string', description: 'The Xero InvoiceID (UUID)' },
+        supplier_name: { type: 'string' },
+        invoice_date: { type: 'string', description: 'YYYY-MM-DD' },
+        due_date: { type: 'string', description: 'YYYY-MM-DD' },
+        reference: { type: ['string', 'null'], description: 'Set or clear (pass null or "")' },
+        status: { type: 'string', description: 'DRAFT, SUBMITTED, AUTHORISED, DELETED' },
+      },
+      required: ['invoice_id'],
+    },
+  },
+  {
+    name: 'attach_receipt_to_bill',
+    description: 'Attach a base64-encoded PDF/image to an existing Xero bill. Use for chat-uploaded receipts. Max size enforced server-side.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        bill_id: { type: 'string' },
+        filename: { type: 'string' },
+        base64_content: { type: 'string' },
+        mime_type: { type: 'string', default: 'application/pdf' },
+      },
+      required: ['bill_id', 'filename', 'base64_content'],
+    },
+  },
+  {
+    name: 'get_open_bills',
+    description: 'Get DRAFT/SUBMITTED/AUTHORISED bills from Xero for reconciliation matching.',
+    inputSchema: { type: 'object', properties: { from_date: { type: 'string' }, to_date: { type: 'string' } } },
+  },
+  {
+    name: 'search_spend_money',
+    description: 'Search Spend Money (SPEND) bank transactions by any combination of reference, contact name, amount (±$0.01), date range, and bank account code. Use for legacy entries where the invoice number may not be in the Reference field. At least one filter required.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        reference: { type: 'string' },
+        contact_name: { type: 'string' },
+        amount: { type: 'number' },
+        from_date: { type: 'string' },
+        to_date: { type: 'string' },
+        bank_account_code: { type: 'string' },
+      },
+    },
+  },
+  {
+    name: 'create_spend_money',
+    description: 'Create an AUTHORISED Spend Money transaction. Defaults to bank account 605 (Business Trans Acct). Sends an Idempotency-Key derived from payee+date+reference+total, so retries won\'t double-create.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        payee_name: { type: 'string', description: 'Auto-created as contact if missing.' },
+        transaction_date: { type: 'string', description: 'YYYY-MM-DD' },
+        reference: { type: 'string' },
+        bank_account_code: { type: 'string', description: 'Default 605. Others: 602 Tyro, 603 Cash Float, 778 Petty Cash.', default: '605' },
+        line_items: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              description: { type: 'string' },
+              quantity: { type: 'number', default: 1 },
+              unit_amount: { type: 'number', description: 'EX-GST amount' },
+              account_code: { type: 'string' },
               tax_type: { type: 'string', default: 'INPUT' },
             },
             required: ['description', 'unit_amount', 'account_code'],
@@ -1135,7 +1669,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'attach_receipt_to_spend_money',
-    description: 'Attach a receipt (PDF or image) to an existing Xero Spend Money transaction.',
+    description: 'Attach a base64-encoded PDF/image to an existing Spend Money. Use for chat-uploaded receipts.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1149,26 +1683,26 @@ const MCP_TOOLS = [
   },
   {
     name: 'list_supplier_invoice_emails',
-    description: 'List Gmail messages under a specified label, with attachment metadata. Designed for the Monday weekly workflow: fetch everything in the "Supplier invoices" label to find unprocessed Moco, Big Michael\'s, and Coca-Cola invoices. Returns messageId + attachmentId for each attachment — use those IDs with attach_gmail_pdf_to_bill / attach_gmail_pdf_to_spend_money. The tool does NOT mark messages as processed; use check_duplicate_invoice on each invoice number to see if it\'s already in Xero.',
+    description: 'List Gmail messages under a label, with attachment metadata. Designed for the daily sweep workflow. Label is case-sensitive (e.g. "Supplier Invoices" with capital I). Returns messageId + attachmentId for each attachment, plus a `failures` array if any individual messages failed to fetch.',
     inputSchema: {
       type: 'object',
       properties: {
-        label: { type: 'string', description: 'Gmail label display name, e.g. "Supplier invoices".' },
-        max_results: { type: 'number', description: 'Max messages to return (default 50).' },
+        label: { type: 'string' },
+        max_results: { type: 'number', description: 'Default 50, max 500.' },
       },
       required: ['label'],
     },
   },
   {
     name: 'attach_gmail_pdf_to_bill',
-    description: 'Attach a PDF from a Gmail message directly to a Xero bill. Railway fetches the attachment server-side — no base64 over MCP — so this works for large PDFs. Use after creating a bill for a supplier whose invoice arrived via Gmail as a PDF attachment.',
+    description: 'Server-side fetch a PDF from a Gmail message and attach to a Xero bill. No base64 over MCP. Use for Norkatu (PDF-source bills).',
     inputSchema: {
       type: 'object',
       properties: {
-        bill_id: { type: 'string', description: 'Xero InvoiceID (UUID) of the bill.' },
-        gmail_message_id: { type: 'string', description: 'Gmail message ID containing the attachment.' },
-        gmail_attachment_id: { type: 'string', description: 'Gmail attachmentId — get this from list_supplier_invoice_emails.' },
-        filename: { type: 'string', description: 'Filename to use in Xero (e.g. "invoice-4217654.pdf").' },
+        bill_id: { type: 'string' },
+        gmail_message_id: { type: 'string' },
+        gmail_attachment_id: { type: 'string' },
+        filename: { type: 'string' },
         mime_type: { type: 'string', default: 'application/pdf' },
       },
       required: ['bill_id', 'gmail_message_id', 'gmail_attachment_id', 'filename'],
@@ -1176,11 +1710,11 @@ const MCP_TOOLS = [
   },
   {
     name: 'attach_gmail_pdf_to_spend_money',
-    description: 'Attach a PDF from a Gmail message directly to a Xero Spend Money transaction. Railway fetches the attachment server-side. Standard path for Moco, Big Michael\'s, Coca-Cola invoices.',
+    description: 'Server-side fetch a PDF from a Gmail message and attach to a Spend Money. Use for Moco, Big Michael\'s, Carbar (PDF-source spend money).',
     inputSchema: {
       type: 'object',
       properties: {
-        bank_transaction_id: { type: 'string', description: 'Xero BankTransactionID (UUID) of the Spend Money txn.' },
+        bank_transaction_id: { type: 'string' },
         gmail_message_id: { type: 'string' },
         gmail_attachment_id: { type: 'string' },
         filename: { type: 'string' },
@@ -1191,20 +1725,20 @@ const MCP_TOOLS = [
   },
   {
     name: 'attach_gmail_email_to_bill',
-    description: 'Attach the raw Gmail message (as .eml) to a Xero bill. Use when the invoice has no PDF attachment and the email body IS the invoice — e.g. Stel Coffee emails from MYOB PayDirect, which have line items in the body but no PDF.',
+    description: 'Attach the raw Gmail message as .eml to a Xero bill. Use for email-only invoices like Stel Coffee (MYOB PayDirect).',
     inputSchema: {
       type: 'object',
       properties: {
         bill_id: { type: 'string' },
         gmail_message_id: { type: 'string' },
-        filename: { type: 'string', description: 'Optional. Defaults to "email-<messageId>.eml".' },
+        filename: { type: 'string' },
       },
       required: ['bill_id', 'gmail_message_id'],
     },
   },
   {
     name: 'attach_gmail_email_to_spend_money',
-    description: 'Attach the raw Gmail message (as .eml) to a Xero Spend Money transaction. Use for email-only invoices paid on card.',
+    description: 'Attach the raw Gmail message as .eml to a Spend Money. Use for CCA (email-body invoice, no PDF).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1217,59 +1751,138 @@ const MCP_TOOLS = [
   },
   {
     name: 'extract_gmail_pdf_text',
-    description: 'Fetch a Gmail PDF attachment server-side, extract its text via pdf-parse, and return the text. Use for supplier invoices where data lives in the PDF (Moco Net/GST figures, Big Michael\'s line items, CCA totals, Norkatu). Get message_id + attachment_id from list_supplier_invoice_emails. Safe for large PDFs — bytes never leave Railway.',
+    description: 'Fetch a Gmail PDF attachment server-side, extract text via pdf-parse. Returns warning if PDF appears image-only (OCR needed). Bytes never leave the Railway server. PDFs are size-capped server-side.',
     inputSchema: {
       type: 'object',
       properties: {
-        message_id: { type: 'string', description: 'Gmail message ID containing the PDF attachment.' },
-        attachment_id: { type: 'string', description: 'Gmail attachmentId (from list_supplier_invoice_emails).' },
-        max_chars: { type: 'number', description: 'Max characters of extracted text to return. Defaults to 50000.' },
+        message_id: { type: 'string' },
+        attachment_id: { type: 'string' },
+        max_chars: { type: 'number', description: 'Default 50000.' },
       },
       required: ['message_id', 'attachment_id'],
     },
   },
   {
     name: 'extract_gmail_email_body',
-    description: 'Fetch a Gmail message server-side and return its body text. Prefers text/plain MIME part; falls back to stripping HTML from text/html if plain text is absent. Use for supplier invoices where invoice data lives in the email body rather than a PDF attachment (e.g. Coca-Cola CCEP Non-Stock Invoice emails from aus.coke.credit@ccamatil.com). Get message_id from list_supplier_invoice_emails. No new OAuth scopes needed — uses the same gmail.readonly scope as extract_gmail_pdf_text.',
+    description: 'Fetch a Gmail message and extract its body text. Returns BOTH plain and HTML-stripped representations. Use prefer="auto" (default) to let the server choose, "plain" for Stel-style invoices, "html" for CCA where the plain-text MIME drops table rows.',
     inputSchema: {
       type: 'object',
       properties: {
-        message_id: { type: 'string', description: 'Gmail message ID.' },
-        max_chars: { type: 'number', description: 'Max characters of body text to return. Defaults to 50000.' },
+        message_id: { type: 'string' },
+        max_chars: { type: 'number', description: 'Default 50000.' },
+        prefer: { type: 'string', description: 'auto | plain | html. Default auto.', default: 'auto' },
       },
       required: ['message_id'],
     },
   },
+  {
+    name: 'create_bill_with_gmail_attachment',
+    description: 'Atomic: create a bill AND attach its source from Gmail in one operation. If the attach step fails, the bill is automatically voided so you don\'t end up with an orphan unattached record. Set use_eml=true for email-body invoices (Stel); leave false for PDF attachments (Norkatu).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        bill: {
+          type: 'object',
+          description: 'Same shape as create_xero_bill input.',
+        },
+        gmail_message_id: { type: 'string' },
+        gmail_attachment_id: { type: 'string', description: 'Required when use_eml is false.' },
+        filename: { type: 'string' },
+        mime_type: { type: 'string' },
+        use_eml: { type: 'boolean', description: 'If true, attach raw .eml instead of a PDF attachment. Default false.' },
+      },
+      required: ['bill', 'gmail_message_id'],
+    },
+  },
+  {
+    name: 'create_spend_money_with_gmail_attachment',
+    description: 'Atomic: create a Spend Money AND attach its Gmail source. Rolls back the Spend Money on attach failure. Set use_eml=true for CCA-style email-body invoices.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        spend: { type: 'object', description: 'Same shape as create_spend_money input.' },
+        gmail_message_id: { type: 'string' },
+        gmail_attachment_id: { type: 'string' },
+        filename: { type: 'string' },
+        mime_type: { type: 'string' },
+        use_eml: { type: 'boolean', default: false },
+      },
+      required: ['spend', 'gmail_message_id'],
+    },
+  },
+  {
+    name: 'void_xero_bill',
+    description: 'Void a Xero bill by setting its status to DELETED (if DRAFT/SUBMITTED) or VOIDED (if AUTHORISED). Use for cleanup if a create succeeded but the workflow needs to be reverted.',
+    inputSchema: {
+      type: 'object',
+      properties: { invoice_id: { type: 'string' } },
+      required: ['invoice_id'],
+    },
+  },
+  {
+    name: 'delete_spend_money',
+    description: 'Delete a Spend Money by setting its status to DELETED. Use for cleanup.',
+    inputSchema: {
+      type: 'object',
+      properties: { bank_transaction_id: { type: 'string' } },
+      required: ['bank_transaction_id'],
+    },
+  },
 ];
 
+// ──────────────────────────────────────────────────────────────────────────
+// executeTool — dispatches MCP tool calls to handler functions DIRECTLY,
+// without HTTP loopback to Express. The original code did localhost HTTP
+// calls which added latency, opened sockets per call, and could fail on
+// localhost DNS quirks.
+// ──────────────────────────────────────────────────────────────────────────
+
 async function executeTool(name, params) {
-  const BASE = `http://localhost:${PORT}`;
   switch (name) {
-    case 'check_duplicate_invoice': return (await axios.get(`${BASE}/api/xero-check-invoice?invoiceNumber=${encodeURIComponent(params.invoice_number)}`)).data;
-    case 'create_xero_bill': return (await axios.post(`${BASE}/api/xero-create-bill`, { supplierName: params.supplier_name, invoiceNumber: params.invoice_number, invoiceDate: params.invoice_date, dueDate: params.due_date, lineItems: (params.line_items || []).map(li => ({ description: li.description, quantity: li.quantity || 1, unitAmount: li.unit_amount, accountCode: li.account_code, taxType: li.tax_type || 'INPUT' })) })).data;
+    case 'check_duplicate_invoice':
+      return xeroCheckInvoice(params.invoice_number);
+
+    case 'search_spend_money':
+      return xeroSearchSpendMoney({
+        reference: params.reference,
+        contactName: params.contact_name,
+        amount: params.amount,
+        fromDate: params.from_date,
+        toDate: params.to_date,
+        bankAccountCode: params.bank_account_code,
+      });
+
+    case 'create_xero_bill':
+      return xeroCreateBill({
+        supplierName: params.supplier_name,
+        invoiceNumber: params.invoice_number,
+        invoiceDate: params.invoice_date,
+        dueDate: params.due_date,
+        status: params.status,
+        lineItems: (params.line_items || []).map(li => ({
+          description: li.description,
+          quantity: li.quantity || 1,
+          unitAmount: li.unit_amount,
+          accountCode: li.account_code,
+          taxType: li.tax_type || 'INPUT',
+        })),
+      });
+
     case 'update_xero_bill':
-      return (await axios.post(`${BASE}/api/xero-update-bill`, {
+      return xeroUpdateBill({
         invoiceId: params.invoice_id,
         supplierName: params.supplier_name,
         invoiceDate: params.invoice_date,
         dueDate: params.due_date,
         reference: params.reference,
         status: params.status,
-      })).data;
-    case 'attach_receipt_to_bill': return (await axios.post(`${BASE}/api/xero-attach-receipt`, { billId: params.bill_id, filename: params.filename, base64Content: params.base64_content, mimeType: params.mime_type || 'application/pdf' })).data;
-    case 'get_open_bills': { const qs = new URLSearchParams(); if (params.from_date) qs.set('fromDate', params.from_date); if (params.to_date) qs.set('toDate', params.to_date); return (await axios.get(`${BASE}/api/xero-open-bills?${qs}`)).data; }
-    case 'search_spend_money': {
-      const qs = new URLSearchParams();
-      if (params.reference) qs.set('reference', params.reference);
-      if (params.contact_name) qs.set('contactName', params.contact_name);
-      if (params.amount !== undefined && params.amount !== null) qs.set('amount', String(params.amount));
-      if (params.from_date) qs.set('fromDate', params.from_date);
-      if (params.to_date) qs.set('toDate', params.to_date);
-      if (params.bank_account_code) qs.set('bankAccountCode', params.bank_account_code);
-      return (await axios.get(`${BASE}/api/xero-search-spend-money?${qs}`)).data;
-    }
+      });
+
+    case 'get_open_bills':
+      return xeroGetOpenBills({ fromDate: params.from_date, toDate: params.to_date });
+
     case 'create_spend_money':
-      return (await axios.post(`${BASE}/api/xero-create-spend-money`, {
+      return xeroCreateSpendMoney({
         payeeName: params.payee_name,
         transactionDate: params.transaction_date,
         reference: params.reference,
@@ -1281,136 +1894,275 @@ async function executeTool(name, params) {
           accountCode: li.account_code,
           taxType: li.tax_type || 'INPUT',
         })),
-      })).data;
-    case 'attach_receipt_to_spend_money':
-      return (await axios.post(`${BASE}/api/xero-attach-receipt-spend-money`, {
-        bankTransactionId: params.bank_transaction_id,
-        filename: params.filename,
-        base64Content: params.base64_content,
-        mimeType: params.mime_type || 'application/pdf',
-      })).data;
-    case 'list_supplier_invoice_emails': {
-      const qs = new URLSearchParams();
-      qs.set('label', params.label);
-      if (params.max_results) qs.set('maxResults', String(params.max_results));
-      return (await axios.get(`${BASE}/api/gmail-list-by-label?${qs}`)).data;
+      });
+
+    case 'attach_receipt_to_bill': {
+      if (!params.bill_id || !params.filename || !params.base64_content) {
+        throw new Error('bill_id, filename, base64_content are required');
+      }
+      const buffer = Buffer.from(params.base64_content, 'base64');
+      if (buffer.length > MAX_PDF_BYTES) throw new Error(`Buffer too large: ${buffer.length}`);
+      return xeroAttachToInvoice(params.bill_id, params.filename, buffer, params.mime_type || 'application/pdf');
     }
-    case 'attach_gmail_pdf_to_bill':
-      return (await axios.post(`${BASE}/api/xero-attach-gmail-pdf-to-bill`, {
-        billId: params.bill_id,
-        gmailMessageId: params.gmail_message_id,
-        gmailAttachmentId: params.gmail_attachment_id,
-        filename: params.filename,
-        mimeType: params.mime_type || 'application/pdf',
-      })).data;
-    case 'attach_gmail_pdf_to_spend_money':
-      return (await axios.post(`${BASE}/api/xero-attach-gmail-pdf-to-spend-money`, {
-        bankTransactionId: params.bank_transaction_id,
-        gmailMessageId: params.gmail_message_id,
-        gmailAttachmentId: params.gmail_attachment_id,
-        filename: params.filename,
-        mimeType: params.mime_type || 'application/pdf',
-      })).data;
-    case 'attach_gmail_email_to_bill':
-      return (await axios.post(`${BASE}/api/xero-attach-gmail-email-to-bill`, {
-        billId: params.bill_id,
-        gmailMessageId: params.gmail_message_id,
-        filename: params.filename,
-      })).data;
-    case 'attach_gmail_email_to_spend_money':
-      return (await axios.post(`${BASE}/api/xero-attach-gmail-email-to-spend-money`, {
-        bankTransactionId: params.bank_transaction_id,
-        gmailMessageId: params.gmail_message_id,
-        filename: params.filename,
-      })).data;
+
+    case 'attach_receipt_to_spend_money': {
+      if (!params.bank_transaction_id || !params.filename || !params.base64_content) {
+        throw new Error('bank_transaction_id, filename, base64_content are required');
+      }
+      const buffer = Buffer.from(params.base64_content, 'base64');
+      if (buffer.length > MAX_PDF_BYTES) throw new Error(`Buffer too large: ${buffer.length}`);
+      return xeroAttachToSpendMoney(params.bank_transaction_id, params.filename, buffer, params.mime_type || 'application/pdf');
+    }
+
+    case 'list_supplier_invoice_emails':
+      return gmailListByLabel({ label: params.label, maxResults: params.max_results });
+
+    case 'attach_gmail_pdf_to_bill': {
+      const buffer = await fetchGmailAttachment(params.gmail_message_id, params.gmail_attachment_id);
+      return xeroAttachToInvoice(params.bill_id, params.filename, buffer, params.mime_type || 'application/pdf');
+    }
+
+    case 'attach_gmail_pdf_to_spend_money': {
+      const buffer = await fetchGmailAttachment(params.gmail_message_id, params.gmail_attachment_id);
+      return xeroAttachToSpendMoney(params.bank_transaction_id, params.filename, buffer, params.mime_type || 'application/pdf');
+    }
+
+    case 'attach_gmail_email_to_bill': {
+      const buffer = await fetchGmailRawMessage(params.gmail_message_id);
+      const name = params.filename || `email-${params.gmail_message_id}.eml`;
+      return xeroAttachToInvoice(params.bill_id, name, buffer, 'message/rfc822');
+    }
+
+    case 'attach_gmail_email_to_spend_money': {
+      const buffer = await fetchGmailRawMessage(params.gmail_message_id);
+      const name = params.filename || `email-${params.gmail_message_id}.eml`;
+      return xeroAttachToSpendMoney(params.bank_transaction_id, name, buffer, 'message/rfc822');
+    }
+
     case 'extract_gmail_pdf_text':
-      return await extractPdfTextFromGmail({
+      return extractPdfTextFromGmail({
         messageId: params.message_id,
         attachmentId: params.attachment_id,
         maxChars: params.max_chars,
       });
+
     case 'extract_gmail_email_body':
-      return await extractEmailBodyFromGmail({
+      return extractEmailBodyFromGmail({
         messageId: params.message_id,
         maxChars: params.max_chars,
+        prefer: params.prefer,
       });
-    default: throw new Error(`Unknown tool: ${name}`);
+
+    case 'create_bill_with_gmail_attachment':
+      return createBillWithGmailAttachment({
+        bill: {
+          supplierName: params.bill?.supplier_name,
+          invoiceNumber: params.bill?.invoice_number,
+          invoiceDate: params.bill?.invoice_date,
+          dueDate: params.bill?.due_date,
+          status: params.bill?.status,
+          lineItems: (params.bill?.line_items || []).map(li => ({
+            description: li.description,
+            quantity: li.quantity || 1,
+            unitAmount: li.unit_amount,
+            accountCode: li.account_code,
+            taxType: li.tax_type || 'INPUT',
+          })),
+        },
+        gmailMessageId: params.gmail_message_id,
+        gmailAttachmentId: params.gmail_attachment_id,
+        filename: params.filename,
+        mimeType: params.mime_type,
+        useEml: !!params.use_eml,
+      });
+
+    case 'create_spend_money_with_gmail_attachment':
+      return createSpendMoneyWithGmailAttachment({
+        spend: {
+          payeeName: params.spend?.payee_name,
+          transactionDate: params.spend?.transaction_date,
+          reference: params.spend?.reference,
+          bankAccountCode: params.spend?.bank_account_code || '605',
+          lineItems: (params.spend?.line_items || []).map(li => ({
+            description: li.description,
+            quantity: li.quantity || 1,
+            unitAmount: li.unit_amount,
+            accountCode: li.account_code,
+            taxType: li.tax_type || 'INPUT',
+          })),
+        },
+        gmailMessageId: params.gmail_message_id,
+        gmailAttachmentId: params.gmail_attachment_id,
+        filename: params.filename,
+        mimeType: params.mime_type,
+        useEml: !!params.use_eml,
+      });
+
+    case 'void_xero_bill':
+      return xeroVoidBill(params.invoice_id);
+
+    case 'delete_spend_money':
+      return xeroDeleteSpendMoney(params.bank_transaction_id);
+
+    default:
+      throw new Error(`Unknown tool: ${name}`);
   }
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// MCP transport: SSE + JSON-RPC over POST
+// ──────────────────────────────────────────────────────────────────────────
+
+const mcpSessions = new Map(); // sessionId -> { res, lastActivity }
+
 function sendToSession(sessionId, data) {
-  const res = mcpSessions.get(sessionId);
-  if (res && !res.writableEnded) res.write(`data: ${JSON.stringify(data)}\n\n`);
+  const session = mcpSessions.get(sessionId);
+  if (session && session.res && !session.res.writableEnded) {
+    session.res.write(`data: ${JSON.stringify(data)}\n\n`);
+    session.lastActivity = Date.now();
+  }
 }
 
-app.get('/sse', (req, res) => {
+// Periodic sweep of stale sessions. Without this, sessions where the 'close'
+// event never fires (e.g. abrupt network drops) would accumulate forever.
+setInterval(() => {
+  const now = Date.now();
+  for (const [sid, s] of mcpSessions.entries()) {
+    if (s.res.writableEnded || now - s.lastActivity > 10 * 60_000) {
+      try { s.res.end(); } catch (e) { /* ignore */ }
+      mcpSessions.delete(sid);
+      console.log(`MCP session swept: ${sid}`);
+    }
+  }
+}, 60_000).unref();
+
+app.get('/sse', requireBearerOrQuery, (req, res) => {
   const sessionId = randomUUID();
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  // CORS deliberately not set here — the bearer check above is the gate.
   res.flushHeaders();
-  mcpSessions.set(sessionId, res);
+  mcpSessions.set(sessionId, { res, lastActivity: Date.now() });
   console.log(`MCP session opened: ${sessionId}`);
+  // Endpoint URI includes the session ID; the auth happens on /messages too.
   res.write(`event: endpoint\ndata: /messages?sessionId=${sessionId}\n\n`);
-  const ping = setInterval(() => { if (!res.writableEnded) res.write(': ping\n\n'); else clearInterval(ping); }, 30_000);
-  req.on('close', () => { mcpSessions.delete(sessionId); clearInterval(ping); console.log(`MCP session closed: ${sessionId}`); });
+  const ping = setInterval(() => {
+    if (!res.writableEnded) res.write(': ping\n\n');
+    else clearInterval(ping);
+  }, 30_000);
+  req.on('close', () => {
+    mcpSessions.delete(sessionId);
+    clearInterval(ping);
+    console.log(`MCP session closed: ${sessionId}`);
+  });
 });
 
-app.post('/messages', async (req, res) => {
+app.post('/messages', requireBearerOrQuery, async (req, res) => {
   const { sessionId } = req.query;
   const message = req.body;
+  // Accept the message immediately; respond async over SSE.
   res.status(202).json({ status: 'accepted' });
   try {
-    const { method, id, params } = message;
+    const { method, id, params } = message || {};
     if (method === 'initialize') {
-      sendToSession(sessionId, { jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'mana-coffee-xero', version: '1.0.0' } } });
+      sendToSession(sessionId, {
+        jsonrpc: '2.0', id,
+        result: {
+          protocolVersion: '2024-11-05',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'mana-coffee-xero', version: '2.0.0' },
+        },
+      });
     } else if (method === 'notifications/initialized') {
+      // JSON-RPC notification — no response by spec.
       return;
     } else if (method === 'tools/list') {
       sendToSession(sessionId, { jsonrpc: '2.0', id, result: { tools: MCP_TOOLS } });
     } else if (method === 'tools/call') {
-      const { name, arguments: args } = params;
+      const { name, arguments: args } = params || {};
       console.log(`MCP tool call: ${name}`);
       try {
-        const result = await executeTool(name, args);
-        sendToSession(sessionId, { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] } });
+        const result = await executeTool(name, args || {});
+        sendToSession(sessionId, {
+          jsonrpc: '2.0', id,
+          result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] },
+        });
       } catch (toolErr) {
-        sendToSession(sessionId, { jsonrpc: '2.0', id, error: { code: -32603, message: toolErr.message } });
+        logError(`MCP TOOL ${name}`, toolErr);
+        sendToSession(sessionId, {
+          jsonrpc: '2.0', id,
+          error: {
+            code: -32603,
+            message: toolErr.response?.data?.Message
+              || toolErr.response?.data?.error?.message
+              || toolErr.message,
+            data: toolErr.response?.data,
+          },
+        });
       }
     } else {
-      sendToSession(sessionId, { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${method}` } });
+      sendToSession(sessionId, {
+        jsonrpc: '2.0', id,
+        error: { code: -32601, message: `Method not found: ${method}` },
+      });
     }
   } catch (err) {
-    sendToSession(sessionId, { jsonrpc: '2.0', id: req.body?.id, error: { code: -32603, message: err.message } });
+    sendToSession(sessionId, {
+      jsonrpc: '2.0', id: req.body?.id,
+      error: { code: -32603, message: err.message },
+    });
   }
 });
 
-app.options('/messages', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.sendStatus(204);
-});
+app.options('/messages', (req, res) => res.sendStatus(204));
 
-app.get('/api/debug', (req, res) => {
-  res.json({
-    clientIdLength: (process.env.XERO_CLIENT_ID || '').length,
-    clientIdStart: (process.env.XERO_CLIENT_ID || '').slice(0, 4),
-    redirectUri: process.env.XERO_REDIRECT_URI,
-    hasSecret: !!process.env.XERO_CLIENT_SECRET,
-    hasStoredRefreshToken: !!xeroStore.refreshToken,
-    tenantId: xeroStore.tenantId,
-    gmail: {
-      clientIdConfigured: !!process.env.GMAIL_CLIENT_ID,
-      clientSecretConfigured: !!process.env.GMAIL_CLIENT_SECRET,
-      redirectUri: process.env.GMAIL_REDIRECT_URI || null,
-      hasStoredRefreshToken: !!gmailStore.refreshToken,
-    },
+// ──────────────────────────────────────────────────────────────────────────
+// Catch-all: serve the SPA only for non-API paths. Original code used a
+// bare app.get('*') which served index.html for typo'd /api/* paths,
+// causing axios HTML-as-JSON parse errors instead of clean 404s.
+// ──────────────────────────────────────────────────────────────────────────
+
+app.use('/api', (req, res) => res.status(404).json({ error: `Unknown route: ${req.method} ${req.path}` }));
+
+// Express 5 requires named wildcard params; '*splat' captures any remaining path.
+// Express 4 also accepts this. We use a regex to be transport-agnostic.
+app.get(/.*/, (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+
+// ──────────────────────────────────────────────────────────────────────────
+// Global error handler (last middleware)
+// ──────────────────────────────────────────────────────────────────────────
+
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  if (res.headersSent) return; // can't write twice
+  logError(`UNHANDLED ${req.method} ${req.path}`, err);
+  const status = err.status || err.response?.status || 500;
+  res.status(status).json({
+    error: err.response?.data?.Message
+      || err.response?.data?.error?.message
+      || err.message,
+    ...(err.response?.data && { xeroResponse: err.response.data }),
   });
 });
 
-app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+// ──────────────────────────────────────────────────────────────────────────
+// Process-level safety nets
+// ──────────────────────────────────────────────────────────────────────────
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Mana Coffee server running on port ${PORT}`));
+process.on('unhandledRejection', (reason) => {
+  console.error('UNHANDLED REJECTION:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err);
+  // Don't exit — Railway will restart anyway, and an in-flight tool call
+  // failing is preferable to losing all sessions.
+});
+
+app.listen(PORT, () => {
+  console.log(`Mana Coffee server v2 listening on port ${PORT}`);
+  console.log(`Public base URL: ${PUBLIC_BASE_URL}`);
+  console.log(`Token store: ${TOKEN_STORE_PATH}${fs.existsSync(TOKEN_STORE_PATH) ? ' (loaded)' : ' (not present — relying on env vars)'}`);
+  console.log(`MCP shared secret configured: ${MCP_SHARED_SECRET.length} chars`);
+  console.log(`CORS allowlist: ${ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(', ') : '(none — same-origin only)'}`);
+});
