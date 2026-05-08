@@ -1,7 +1,17 @@
 /**
  * Mana Coffee — Xero / Gmail / MCP server
  *
- * This is the hardened v2 of server.js. Major changes vs the original:
+ * v2.1 (08/05/2026) — Chunked upload for large chat-uploaded receipts.
+ *   - Adds three MCP tools: `upload_receipt_chunk`, `attach_uploaded_receipt_to_bill`,
+ *     `attach_uploaded_receipt_to_spend_money`. Closes the gap where a single
+ *     base64 payload over MCP gets truncated by the LLM client (~10KB practical
+ *     ceiling) but the underlying receipt is 50KB+. Caller splits the base64
+ *     into chunks, server stitches them, then attaches to Xero in one shot.
+ *   - In-memory upload state with 1-hour TTL. Lost on Railway redeploy, which
+ *     is fine — uploads are seconds-long, not hours.
+ *   - The existing `attach_receipt_to_*` tools still work for small receipts.
+ *
+ * v2 (29/04/2026) — Hardening pass. Major changes vs original:
  *
  *  Security
  *    - Shared-secret bearer auth on /sse, /messages, /api/* (except OAuth flows)
@@ -40,6 +50,8 @@
  *    TOKEN_STORE_PATH     - Optional. Defaults to /data/tokens.json. Mount a Railway
  *                           volume at /data for cross-redeploy persistence.
  *    MAX_PDF_BYTES        - Optional. Default 25_000_000 (25 MB).
+ *    MAX_UPLOAD_CHUNK_CHARS - Optional. Default 200_000. Per-chunk base64 cap.
+ *    MAX_UPLOAD_CHUNKS    - Optional. Default 500. Per-upload chunk-count cap.
  */
 
 const express = require('express');
@@ -58,6 +70,9 @@ const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}
 const MCP_SHARED_SECRET = process.env.MCP_SHARED_SECRET || '';
 const TOKEN_STORE_PATH = process.env.TOKEN_STORE_PATH || '/data/tokens.json';
 const MAX_PDF_BYTES = Number(process.env.MAX_PDF_BYTES) || 25_000_000;
+const MAX_UPLOAD_CHUNK_CHARS = Number(process.env.MAX_UPLOAD_CHUNK_CHARS) || 200_000;
+const MAX_UPLOAD_CHUNKS = Number(process.env.MAX_UPLOAD_CHUNKS) || 500;
+const UPLOAD_TTL_MS = 60 * 60_000; // 1 hour
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
@@ -212,6 +227,26 @@ setInterval(() => {
 }, 5 * 60_000).unref();
 
 // ──────────────────────────────────────────────────────────────────────────
+// Chunked-upload state (v2.1)
+// ──────────────────────────────────────────────────────────────────────────
+//
+// In-memory only — survives within a Railway process, lost on redeploy.
+// That's fine; uploads are seconds-long, not hours. The 1-hour TTL is a
+// generous backstop in case Claude abandons an upload mid-flight.
+
+const uploadsInProgress = new Map(); // uploadId -> { chunks: Buffer[], totalBytes, createdAt }
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, entry] of uploadsInProgress.entries()) {
+    if (now - entry.createdAt > UPLOAD_TTL_MS) {
+      uploadsInProgress.delete(id);
+      console.log(`Upload swept: ${id} (${entry.totalBytes} bytes, ${entry.chunks.length} chunks)`);
+    }
+  }
+}, 5 * 60_000).unref();
+
+// ──────────────────────────────────────────────────────────────────────────
 // Express app, CORS, body parsing
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -329,7 +364,7 @@ function redactForLog(obj) {
   if (!obj || typeof obj !== 'object') return obj;
   const clone = Array.isArray(obj) ? [...obj] : { ...obj };
   for (const key of Object.keys(clone)) {
-    if (/base64|content/i.test(key) && typeof clone[key] === 'string' && clone[key].length > 200) {
+    if (/base64|content|chunk/i.test(key) && typeof clone[key] === 'string' && clone[key].length > 200) {
       clone[key] = `[redacted ${clone[key].length} chars]`;
     } else if (typeof clone[key] === 'object' && clone[key] !== null) {
       clone[key] = redactForLog(clone[key]);
@@ -976,6 +1011,114 @@ async function xeroAttachToSpendMoney(bankTransactionId, filename, buffer, mimeT
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Chunked upload handlers (v2.1)
+// ──────────────────────────────────────────────────────────────────────────
+//
+// Pattern:
+//   1. Caller splits a large base64 payload into chunks of <= MAX_UPLOAD_CHUNK_CHARS
+//   2. First call to appendReceiptChunk omits uploadId; server returns one
+//   3. Subsequent calls pass the same uploadId
+//   4. After last chunk, caller invokes attachUploadedReceiptTo{Bill,SpendMoney}
+//      which assembles and attaches in one Xero call
+//
+// On attach failure, the upload buffer is preserved so the caller can retry
+// without re-uploading. Successful attaches consume (delete) the buffer.
+
+function appendReceiptChunk(uploadId, base64Chunk) {
+  if (typeof base64Chunk !== 'string' || !base64Chunk.length) {
+    const err = new Error('base64_chunk required (non-empty string)');
+    err.status = 400;
+    throw err;
+  }
+  if (base64Chunk.length > MAX_UPLOAD_CHUNK_CHARS) {
+    const err = new Error(`Chunk too large: ${base64Chunk.length} chars (max ${MAX_UPLOAD_CHUNK_CHARS}). Split into smaller pieces.`);
+    err.status = 413;
+    throw err;
+  }
+
+  let entry;
+  let id = uploadId;
+  if (id) {
+    entry = uploadsInProgress.get(id);
+    if (!entry) {
+      const err = new Error(`Upload ${id} not found or expired (TTL is ${Math.round(UPLOAD_TTL_MS / 60000)} min). Start a new upload by omitting upload_id.`);
+      err.status = 404;
+      throw err;
+    }
+  } else {
+    id = randomUUID();
+    entry = { chunks: [], totalBytes: 0, createdAt: Date.now() };
+    uploadsInProgress.set(id, entry);
+  }
+
+  // Decode immediately — this catches base64 corruption per-chunk rather
+  // than at finalize time.
+  let buffer;
+  try {
+    buffer = Buffer.from(base64Chunk, 'base64');
+  } catch (e) {
+    const err = new Error(`base64 decode failed: ${e.message}`);
+    err.status = 400;
+    throw err;
+  }
+
+  entry.chunks.push(buffer);
+  entry.totalBytes += buffer.length;
+
+  if (entry.chunks.length > MAX_UPLOAD_CHUNKS) {
+    uploadsInProgress.delete(id);
+    const err = new Error(`Too many chunks: ${entry.chunks.length} (max ${MAX_UPLOAD_CHUNKS}). Use larger chunks.`);
+    err.status = 413;
+    throw err;
+  }
+  if (entry.totalBytes > MAX_PDF_BYTES) {
+    uploadsInProgress.delete(id);
+    const err = new Error(`Upload exceeds ${MAX_PDF_BYTES} bytes (got ${entry.totalBytes}).`);
+    err.status = 413;
+    throw err;
+  }
+
+  return {
+    upload_id: id,
+    chunks_received: entry.chunks.length,
+    total_bytes: entry.totalBytes,
+    chunk_bytes: buffer.length,
+  };
+}
+
+function consumeUpload(uploadId, deleteOnSuccess) {
+  if (!uploadId) {
+    const err = new Error('upload_id required');
+    err.status = 400;
+    throw err;
+  }
+  const entry = uploadsInProgress.get(uploadId);
+  if (!entry) {
+    const err = new Error(`Upload ${uploadId} not found or expired`);
+    err.status = 404;
+    throw err;
+  }
+  return {
+    buffer: Buffer.concat(entry.chunks, entry.totalBytes),
+    cleanup: () => { if (deleteOnSuccess) uploadsInProgress.delete(uploadId); },
+  };
+}
+
+async function attachUploadedReceiptToSpendMoney(uploadId, bankTransactionId, filename, mimeType) {
+  const { buffer, cleanup } = consumeUpload(uploadId, true);
+  const result = await xeroAttachToSpendMoney(bankTransactionId, filename, buffer, mimeType || 'application/pdf');
+  cleanup(); // only delete on success — failure leaves the upload intact for retry
+  return { ...result, upload_id: uploadId, consumed: true };
+}
+
+async function attachUploadedReceiptToBill(uploadId, billId, filename, mimeType) {
+  const { buffer, cleanup } = consumeUpload(uploadId, true);
+  const result = await xeroAttachToInvoice(billId, filename, buffer, mimeType || 'application/pdf');
+  cleanup();
+  return { ...result, upload_id: uploadId, consumed: true };
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Gmail handler functions
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -1310,6 +1453,13 @@ app.get('/api/debug', requireBearer, (req, res) => {
       hasStoredRefreshToken: !!gmailStore.refreshToken,
     },
     activeMcpSessions: mcpSessions.size,
+    activeUploads: uploadsInProgress.size,
+    uploadLimits: {
+      maxChunkChars: MAX_UPLOAD_CHUNK_CHARS,
+      maxChunks: MAX_UPLOAD_CHUNKS,
+      maxTotalBytes: MAX_PDF_BYTES,
+      ttlMinutes: Math.round(UPLOAD_TTL_MS / 60000),
+    },
   });
 });
 
@@ -1489,6 +1639,27 @@ app.post('/api/xero-attach-receipt-spend-money', requireBearer, asyncRoute(async
   res.json(result);
 }));
 
+// Chunked upload routes (v2.1)
+app.post('/api/upload-chunk', requireBearer, asyncRoute(async (req, res) => {
+  logSection('UPLOAD CHUNK', { upload_id: req.body.upload_id, chunk_chars: req.body.base64_chunk?.length });
+  const result = appendReceiptChunk(req.body.upload_id, req.body.base64_chunk);
+  res.json(result);
+}));
+
+app.post('/api/attach-uploaded-to-spend-money', requireBearer, asyncRoute(async (req, res) => {
+  logSection('ATTACH UPLOADED TO SPEND MONEY', req.body);
+  const { upload_id, bank_transaction_id, filename, mime_type } = req.body;
+  const result = await attachUploadedReceiptToSpendMoney(upload_id, bank_transaction_id, filename, mime_type);
+  res.json(result);
+}));
+
+app.post('/api/attach-uploaded-to-bill', requireBearer, asyncRoute(async (req, res) => {
+  logSection('ATTACH UPLOADED TO BILL', req.body);
+  const { upload_id, bill_id, filename, mime_type } = req.body;
+  const result = await attachUploadedReceiptToBill(upload_id, bill_id, filename, mime_type);
+  res.json(result);
+}));
+
 app.get('/api/gmail-list-by-label', requireBearer, asyncRoute(async (req, res) => {
   const result = await gmailListByLabel({ label: req.query.label, maxResults: req.query.maxResults });
   res.json(result);
@@ -1607,7 +1778,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'attach_receipt_to_bill',
-    description: 'Attach a base64-encoded PDF/image to an existing Xero bill. Use for chat-uploaded receipts. Max size enforced server-side.',
+    description: 'Attach a base64-encoded PDF/image to an existing Xero bill in a single call. Use ONLY for small receipts (under ~10KB base64). For larger files, use upload_receipt_chunk + attach_uploaded_receipt_to_bill instead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1669,7 +1840,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'attach_receipt_to_spend_money',
-    description: 'Attach a base64-encoded PDF/image to an existing Spend Money. Use for chat-uploaded receipts.',
+    description: 'Attach a base64-encoded PDF/image to an existing Spend Money in a single call. Use ONLY for small receipts (under ~10KB base64). For larger files, use upload_receipt_chunk + attach_uploaded_receipt_to_spend_money instead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1679,6 +1850,46 @@ const MCP_TOOLS = [
         mime_type: { type: 'string', default: 'application/pdf' },
       },
       required: ['bank_transaction_id', 'filename', 'base64_content'],
+    },
+  },
+  {
+    name: 'upload_receipt_chunk',
+    description: 'Upload one chunk of a base64-encoded receipt for later attachment. Use this when a receipt is too large for a single attach_receipt_to_* call (typically >10KB base64). Workflow: split the base64 into chunks (recommended ~6-8KB each, server max 200KB), call this for each chunk in order. First call: omit upload_id; server returns one. Subsequent calls: pass the same upload_id. Server decodes each chunk on receipt so corruption fails fast. After the final chunk, call attach_uploaded_receipt_to_bill or attach_uploaded_receipt_to_spend_money. Uploads expire 60 minutes after the first chunk.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        upload_id: { type: 'string', description: 'Omit on the first chunk to start a new upload. Pass on subsequent chunks.' },
+        base64_chunk: { type: 'string', description: 'A contiguous slice of the base64-encoded file. Order matters — server concatenates chunks in call order.' },
+      },
+      required: ['base64_chunk'],
+    },
+  },
+  {
+    name: 'attach_uploaded_receipt_to_spend_money',
+    description: 'Attach a previously-uploaded chunked receipt to a Spend Money. Pass the upload_id returned by upload_receipt_chunk. The upload buffer is consumed (deleted) on success. On Xero attach failure, the buffer is preserved so you can retry without re-uploading.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        upload_id: { type: 'string' },
+        bank_transaction_id: { type: 'string' },
+        filename: { type: 'string' },
+        mime_type: { type: 'string', default: 'application/pdf' },
+      },
+      required: ['upload_id', 'bank_transaction_id', 'filename'],
+    },
+  },
+  {
+    name: 'attach_uploaded_receipt_to_bill',
+    description: 'Attach a previously-uploaded chunked receipt to a Bill. Same pattern as attach_uploaded_receipt_to_spend_money.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        upload_id: { type: 'string' },
+        bill_id: { type: 'string' },
+        filename: { type: 'string' },
+        mime_type: { type: 'string', default: 'application/pdf' },
+      },
+      required: ['upload_id', 'bill_id', 'filename'],
     },
   },
   {
@@ -1914,6 +2125,25 @@ async function executeTool(name, params) {
       return xeroAttachToSpendMoney(params.bank_transaction_id, params.filename, buffer, params.mime_type || 'application/pdf');
     }
 
+    case 'upload_receipt_chunk':
+      return appendReceiptChunk(params.upload_id, params.base64_chunk);
+
+    case 'attach_uploaded_receipt_to_spend_money':
+      return attachUploadedReceiptToSpendMoney(
+        params.upload_id,
+        params.bank_transaction_id,
+        params.filename,
+        params.mime_type
+      );
+
+    case 'attach_uploaded_receipt_to_bill':
+      return attachUploadedReceiptToBill(
+        params.upload_id,
+        params.bill_id,
+        params.filename,
+        params.mime_type
+      );
+
     case 'list_supplier_invoice_emails':
       return gmailListByLabel({ label: params.label, maxResults: params.max_results });
 
@@ -2077,7 +2307,7 @@ app.post('/messages', requireBearerOrQuery, async (req, res) => {
         result: {
           protocolVersion: '2024-11-05',
           capabilities: { tools: {} },
-          serverInfo: { name: 'mana-coffee-xero', version: '2.0.0' },
+          serverInfo: { name: 'mana-coffee-xero', version: '2.1.0' },
         },
       });
     } else if (method === 'notifications/initialized') {
@@ -2166,9 +2396,10 @@ process.on('uncaughtException', (err) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Mana Coffee server v2 listening on port ${PORT}`);
+  console.log(`Mana Coffee server v2.1 listening on port ${PORT}`);
   console.log(`Public base URL: ${PUBLIC_BASE_URL}`);
   console.log(`Token store: ${TOKEN_STORE_PATH}${fs.existsSync(TOKEN_STORE_PATH) ? ' (loaded)' : ' (not present — relying on env vars)'}`);
   console.log(`MCP shared secret configured: ${MCP_SHARED_SECRET.length} chars`);
+  console.log(`Upload limits: ${MAX_UPLOAD_CHUNK_CHARS} chars/chunk, ${MAX_UPLOAD_CHUNKS} chunks max, ${MAX_PDF_BYTES} bytes total, ${Math.round(UPLOAD_TTL_MS / 60000)} min TTL`);
   console.log(`CORS allowlist: ${ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(', ') : '(none — same-origin only)'}`);
 });
